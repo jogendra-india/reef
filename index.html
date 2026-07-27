@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- interactive-widget fixes Chrome/Android when the keyboard opens. iOS
+     ignores it, so app.js drives --kb from visualViewport instead. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#061419">
+<title>Reef</title>
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<style>
+:root{
+  --bg:#061419; --surface:#0C2028; --surface-2:#122c36; --line:#1b3b46;
+  --text:#E6F1F4; --muted:#8AA6AF; --accent:#38BFA7; --accent-ink:#04211d;
+  --mine:#12524B; --mine-text:#E9FBF7; --theirs:#12262E;
+  --danger:#E4685D;
+  --kb:0px;
+  --safe-top:env(safe-area-inset-top,0px);
+  --safe-bottom:env(safe-area-inset-bottom,0px);
+  --radius:18px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
+html,body{margin:0;padding:0;height:100dvh;overflow:hidden;}
+body{
+  background:var(--bg);color:var(--text);
+  font:16px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;
+  overscroll-behavior:none;
+}
+button,input,textarea{font:inherit;color:inherit;}
+button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
+.tap{min-width:48px;min-height:48px;display:flex;align-items:center;justify-content:center;}
+
+#app{height:100dvh;display:flex;flex-direction:column;position:relative;}
+.screen{display:none;flex-direction:column;height:100dvh;}
+.screen.on{display:flex;}
+
+/* ---------------- Lock ---------------- */
+#lock{align-items:center;justify-content:space-between;padding:calc(var(--safe-top) + 8vh) 24px calc(var(--safe-bottom) + 24px);}
+.mark{display:flex;flex-direction:column;align-items:center;gap:18px;}
+.mark svg{width:64px;height:64px;opacity:.9;}
+.dots{display:flex;gap:13px;margin-top:6px;min-height:14px;}
+.dot{width:14px;height:14px;border-radius:50%;border:1.5px solid var(--line);transition:transform .12s,background .12s;}
+.dot.full{background:var(--accent);border-color:var(--accent);transform:scale(1.12);}
+.dots.wrong{animation:shake .4s;}
+@keyframes shake{10%,90%{transform:translateX(-5px)}30%,70%{transform:translateX(6px)}50%{transform:translateX(-3px)}}
+#lock-note{color:var(--muted);font-size:14px;min-height:20px;text-align:center;}
+.keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;width:100%;max-width:320px;}
+.key{height:72px;border-radius:20px;background:var(--surface);font-size:26px;font-weight:500;
+     display:flex;align-items:center;justify-content:center;transition:background .1s,transform .1s;}
+.key:active{background:var(--surface-2);transform:scale(.96);}
+.key.blank{background:none;}
+.key.util{font-size:20px;color:var(--muted);}
+
+/* ---------------- Pending ---------------- */
+#pending{align-items:center;justify-content:center;gap:14px;padding:32px;text-align:center;}
+#pending h2{margin:0;font-size:20px;font-weight:600;}
+#pending p{margin:0;color:var(--muted);max-width:34ch;}
+
+/* ---------------- Pool ---------------- */
+#hdr{
+  display:flex;align-items:center;gap:12px;
+  padding:calc(var(--safe-top) + 8px) 12px 8px;
+  background:linear-gradient(#061419,#061419e6);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--line);flex:0 0 auto;position:relative;z-index:3;
+}
+.avatar{width:38px;height:38px;border-radius:50%;background:var(--surface-2);
+        display:flex;align-items:center;justify-content:center;font-size:20px;flex:0 0 auto;}
+.who{flex:1;min-width:0;}
+.who b{display:block;font-size:16px;font-weight:600;line-height:1.2;}
+.who span{display:block;font-size:12.5px;color:var(--muted);line-height:1.3;}
+.who span.live{color:var(--accent);}
+
+#scroller{
+  flex:1;overflow-y:auto;overflow-x:hidden;
+  overscroll-behavior-y:contain;-webkit-overflow-scrolling:touch;
+  padding:8px 10px 4px;
+}
+#list{display:flex;flex-direction:column;gap:2px;}
+
+.day{align-self:center;margin:14px 0 8px;padding:4px 12px;border-radius:12px;
+     background:var(--surface);color:var(--muted);font-size:12px;font-weight:500;}
+.newline{align-self:stretch;display:flex;align-items:center;gap:10px;margin:10px 2px;color:var(--accent);font-size:12px;}
+.newline:before,.newline:after{content:"";flex:1;height:1px;background:var(--accent);opacity:.35;}
+
+.row{display:flex;width:100%;touch-action:pan-y;}
+.row.mine{justify-content:flex-end;}
+.row.gap{margin-top:8px;}
+
+.bubble{
+  position:relative;max-width:78%;padding:8px 11px 6px;border-radius:var(--radius);
+  background:var(--theirs);word-wrap:break-word;overflow-wrap:anywhere;
+  -webkit-touch-callout:none;user-select:none;transition:transform .18s cubic-bezier(.2,.8,.3,1);
+}
+.mine .bubble{background:var(--mine);color:var(--mine-text);}
+.row.tail:not(.mine) .bubble{border-bottom-left-radius:6px;}
+.row.tail.mine .bubble{border-bottom-right-radius:6px;}
+.bubble .txt{white-space:pre-wrap;}
+.bubble.jumbo .txt{font-size:40px;line-height:1.2;}
+.bubble.jumbo{background:none!important;padding:2px 4px;}
+
+.meta{display:flex;align-items:center;justify-content:flex-end;gap:4px;
+      font-size:11px;color:var(--muted);margin-top:2px;}
+.mine .meta{color:#9fd8cf;}
+.tick{font-size:11px;letter-spacing:-2px;}
+.tick.read{color:#7FD5FF;}
+
+.quote{border-left:3px solid var(--accent);padding:3px 8px;margin-bottom:5px;
+       background:#ffffff10;border-radius:8px;font-size:13.5px;color:var(--muted);
+       max-height:52px;overflow:hidden;}
+.bubble.gone .txt{font-style:italic;color:var(--muted);}
+
+.media{display:block;max-width:100%;border-radius:12px;margin-bottom:4px;background:#0a1a20;}
+.media.pending{filter:blur(8px);}
+.reacts{display:flex;gap:3px;margin-top:4px;}
+.react{background:var(--surface);border:1px solid var(--line);border-radius:11px;
+       padding:1px 6px;font-size:13px;}
+
+.pill{position:absolute;left:50%;transform:translateX(-50%);bottom:calc(100% + 10px);
+      background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:600;
+      padding:8px 14px;border-radius:20px;box-shadow:0 6px 18px #0008;z-index:4;}
+
+/* ---------------- Composer ---------------- */
+#composer{
+  flex:0 0 auto;position:relative;
+  padding:6px 8px calc(6px + var(--kb) + var(--safe-bottom));
+  background:var(--bg);border-top:1px solid var(--line);
+  transition:padding-bottom .12s ease-out;
+}
+#reply-strip{display:none;align-items:center;gap:8px;margin:2px 4px 6px;padding:6px 8px;
+             background:var(--surface);border-left:3px solid var(--accent);border-radius:8px;font-size:13.5px;}
+#reply-strip .grow{flex:1;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#edit-strip{display:none;align-items:center;gap:8px;margin:2px 4px 6px;padding:6px 8px;
+            background:var(--surface);border-left:3px solid #E8C36A;border-radius:8px;font-size:13px;color:var(--muted);}
+.inputrow{display:flex;align-items:flex-end;gap:4px;}
+#text{
+  flex:1;resize:none;border:0;outline:0;background:var(--surface);
+  border-radius:20px;padding:11px 14px;max-height:132px;min-height:44px;line-height:1.35;
+}
+#text::placeholder{color:#5d7d87;}
+#send{width:48px;height:48px;border-radius:50%;background:var(--accent);color:var(--accent-ink);
+      display:flex;align-items:center;justify-content:center;font-size:20px;flex:0 0 auto;}
+#send:disabled{opacity:.45;}
+
+/* ---------------- Emoji ---------------- */
+#emoji{display:none;height:270px;overflow-y:auto;overscroll-behavior:contain;padding:6px 4px;}
+#emoji.on{display:block;}
+.emoji-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:2px;}
+.emoji-grid button{height:42px;font-size:24px;border-radius:10px;}
+.emoji-grid button:active{background:var(--surface);}
+.emoji-head{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;margin:8px 6px 3px;}
+
+/* ---------------- Sheet ---------------- */
+#scrim{position:fixed;inset:0;background:#000a;opacity:0;pointer-events:none;
+       transition:opacity .18s;z-index:8;}
+#scrim.on{opacity:1;pointer-events:auto;}
+#sheet{position:fixed;left:0;right:0;bottom:0;z-index:9;transform:translateY(102%);
+       transition:transform .24s cubic-bezier(.2,.8,.3,1);
+       background:var(--surface);border-radius:22px 22px 0 0;
+       padding:8px 10px calc(12px + var(--safe-bottom));box-shadow:0 -8px 30px #0009;}
+#sheet.on{transform:translateY(0);}
+.grab{width:38px;height:4px;border-radius:2px;background:var(--line);margin:4px auto 10px;}
+.quickreacts{display:flex;justify-content:space-around;padding:4px 2px 10px;border-bottom:1px solid var(--line);margin-bottom:6px;}
+.quickreacts button{font-size:28px;width:44px;height:44px;border-radius:50%;}
+.quickreacts button:active{background:var(--surface-2);}
+.act{display:flex;align-items:center;gap:14px;width:100%;padding:13px 12px;border-radius:12px;font-size:16px;}
+.act:active{background:var(--surface-2);}
+.act .ico{width:22px;text-align:center;font-size:17px;}
+.act.bad{color:var(--danger);}
+.sheet-title{padding:2px 12px 10px;color:var(--muted);font-size:13px;}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;line-height:1.9;
+      letter-spacing:.04em;background:var(--bg);padding:12px;border-radius:12px;word-spacing:6px;}
+
+/* ---------------- Viewer ---------------- */
+#viewer{position:fixed;inset:0;background:#000;z-index:20;display:none;
+        align-items:center;justify-content:center;touch-action:none;}
+#viewer.on{display:flex;}
+#viewer img,#viewer video{max-width:100%;max-height:100%;}
+#viewer .close{position:absolute;top:calc(var(--safe-top) + 8px);right:8px;font-size:22px;color:#fff;}
+
+/* ---------------- Privacy blur ---------------- */
+#privacy{position:fixed;inset:0;z-index:30;background:var(--bg);
+         display:none;align-items:center;justify-content:center;}
+#privacy.on{display:flex;}
+
+#toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(80px + var(--safe-bottom));
+       background:var(--surface-2);border:1px solid var(--line);color:var(--text);
+       padding:9px 16px;border-radius:20px;font-size:14px;z-index:40;opacity:0;
+       transition:opacity .2s;pointer-events:none;max-width:80vw;text-align:center;}
+#toast.on{opacity:1;}
+
+@media (prefers-reduced-motion: reduce){
+  *{animation:none!important;transition:none!important;}
+}
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <section id="lock" class="screen on">
+    <div class="mark">
+      <svg viewBox="0 0 64 64" fill="none" aria-hidden="true">
+        <path d="M4 40c6-6 12-6 18 0s12 6 18 0 12-6 18 0" stroke="#38BFA7" stroke-width="3.5" stroke-linecap="round"/>
+        <path d="M4 52c6-6 12-6 18 0s12 6 18 0 12-6 18 0" stroke="#1b3b46" stroke-width="3.5" stroke-linecap="round"/>
+        <circle cx="32" cy="20" r="7" stroke="#38BFA7" stroke-width="3.5"/>
+      </svg>
+      <!-- Dots are generated from PIN_LENGTH in app.js, so the two can never
+           disagree about how many digits a PIN has. -->
+      <div class="dots" id="dots"></div>
+      <div id="lock-note"></div>
+    </div>
+    <div class="keypad" id="keypad"></div>
+  </section>
+
+  <section id="pending" class="screen">
+    <div style="font-size:44px">🐚</div>
+    <h2>Waiting to be let in</h2>
+    <p id="pending-note">The other person needs to approve this device before anything appears here.</p>
+    <button class="act" id="pending-retry" style="justify-content:center;color:var(--accent)">Enter my PIN again</button>
+    <button class="act" id="pending-signout" style="justify-content:center;color:var(--muted)">Start over on this device</button>
+  </section>
+
+  <section id="pool" class="screen">
+    <header id="hdr">
+      <div class="avatar" id="peer-avatar">🐟</div>
+      <div class="who">
+        <b id="peer-name">Reef</b>
+        <span id="peer-state">connecting…</span>
+      </div>
+      <button class="tap" id="menu" aria-label="More">⋯</button>
+    </header>
+
+    <div id="scroller"><div id="list"></div></div>
+
+    <div id="composer">
+      <div id="new-pill-host" style="position:relative"></div>
+      <div id="reply-strip">
+        <span class="grow" id="reply-text"></span>
+        <button class="tap" id="reply-cancel" aria-label="Cancel reply">✕</button>
+      </div>
+      <div id="peer-missing" style="display:none;align-items:center;gap:8px;margin:2px 4px 6px;
+           padding:8px 10px;background:var(--surface);border-left:3px solid var(--danger);
+           border-radius:8px;font-size:13px;color:var(--muted)">
+        <span>🐚</span>
+        <span class="grow">The other side has no approved device yet — nothing can be sent.</span>
+      </div>
+      <div id="edit-strip"
+        <span class="grow" id="edit-note"></span>
+        <button class="tap" id="edit-cancel" aria-label="Cancel edit">✕</button>
+      </div>
+      <div class="inputrow">
+        <button class="tap" id="attach" aria-label="Attach">＋</button>
+        <textarea id="text" rows="1" placeholder="Say something…"
+                  enterkeyhint="send" autocomplete="off" autocorrect="on"></textarea>
+        <button class="tap" id="emoji-btn" aria-label="Emoji">☺</button>
+        <button id="send" aria-label="Send" disabled>➤</button>
+      </div>
+      <div id="emoji"></div>
+      <input type="file" id="file-input" accept="image/*,video/*" hidden multiple>
+    </div>
+  </section>
+
+</div>
+
+<div id="scrim"></div>
+<div id="sheet"></div>
+<div id="viewer"><button class="close tap" id="viewer-close" aria-label="Close">✕</button></div>
+<div id="privacy"><div style="font-size:40px;opacity:.5">🪸</div></div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script src="./crypto.js"></script>
+<script src="./db.js"></script>
+<script src="./api.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
