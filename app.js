@@ -475,6 +475,27 @@
     return state.pairKeys[deviceId];
   }
 
+  /* `recipients` is the list to *seal for*, and it deliberately includes this
+   * person's own other devices — your laptop has to be able to read what you
+   * sent from your phone. It is therefore the wrong list for every question that
+   * means "the other person": whether there is anybody to talk to, whose name is
+   * in the header, who just came online, whose reaction that is.
+   *
+   * Slot is what separates them, and it rides along on every device the server
+   * describes. */
+  const peerRecipients = () =>
+    state.recipients.filter(
+      (r) => !state.session || r.slot !== state.session.slot
+    );
+
+  const isOwnDevice = (deviceId) => {
+    const id = String(deviceId);
+    if (id === String(state.device.id)) return true;
+    return state.recipients.some(
+      (r) => String(r.id) === id && state.session && r.slot === state.session.slot
+    );
+  };
+
   /* ==================================================================== *
    * History
    * ==================================================================== */
@@ -612,7 +633,7 @@
     new Date(iso).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
 
   function peerProfile() {
-    const recipient = state.recipients[0];
+    const recipient = peerRecipients()[0];
     return (
       (recipient && state.profiles[recipient.id]) || { handle: 'Reef', emoji: '🐟' }
     );
@@ -817,7 +838,8 @@
         if (!reaction.emoji) return;
         // Two people reacting produced two identical-looking chips with nothing
         // to say which was whose. Yours is marked, and the rest is in Details.
-        const own = String(reaction.device_id) === String(state.device.id);
+        // Yours as a person, not just from this device.
+        const own = isOwnDevice(reaction.device_id);
         reacts.appendChild(
           el('span', 'react' + (own ? ' own' : ''), reaction.emoji)
         );
@@ -1078,7 +1100,8 @@
 
   function paintPeerMissing() {
     const strip = $('peer-missing');
-    const missing = !state.recipients.length;
+    // Your own second device is not somebody to talk to.
+    const missing = !peerRecipients().length;
     strip.style.display = missing ? 'flex' : 'none';
     if (missing) {
       // Saying only "nothing can be sent" left nothing to do about it. When a
@@ -1725,6 +1748,7 @@
     if (profile && profile.handle) {
       return `${profile.emoji || ''} ${profile.handle}`.trim();
     }
+    if (isOwnDevice(id)) return 'Another of your devices';
     if (state.recipients.some((r) => String(r.id) === id)) {
       const peer = peerProfile();
       return peer.handle && peer.handle !== 'Reef' ? peer.handle : 'The other person';
@@ -1802,7 +1826,7 @@
       // which.
       action(
         '✉️',
-        state.recipients.length ? 'Start a new conversation' : 'Invite someone here',
+        peerRecipients().length ? 'Start a new conversation' : 'Invite someone here',
         openInviteSheet
       );
       if (Object.keys(state.sessions).length > 1) {
@@ -1892,7 +1916,7 @@
       .map((d) => String(d.id))
       .sort()
       .join(',');
-    const peersKnown = state.recipients
+    const peersKnown = peerRecipients()
       .map((r) => String(r.id))
       .sort()
       .join(',');
@@ -1993,7 +2017,7 @@
       // Say up front where the person will land. The server fills the free seat
       // in this room when there is one and nothing has been said yet, and only
       // starts a separate conversation otherwise.
-      const here = !state.recipients.length;
+      const here = !peerRecipients().length;
       const lede = el(
         'div',
         'sheet-title',
@@ -2294,8 +2318,11 @@
         const bits = [device.is_self ? 'this device' : null];
         bits.push(DEVICE_STATUS[device.status] || device.status);
         bits.push('#' + device.id);
-        if (device.created_at) bits.push('added ' + dayLabel(device.created_at));
-        if (device.last_seen_at) bits.push('last seen ' + dayLabel(device.last_seen_at));
+        // dayLabel says "Today", which is the one thing you already knew. When
+        // you are deciding which of two similar devices to sign out, the time is
+        // the whole of the useful information.
+        if (device.created_at) bits.push('added ' + stamp(device.created_at));
+        if (device.last_seen_at) bits.push('last seen ' + stamp(device.last_seen_at));
         return bits.filter(Boolean).join(' · ');
       };
 
@@ -2724,7 +2751,7 @@
         // as swimming on the strength of its own connection.
         const who = String(event.device_id || '');
         if (!who || who === String(state.device.id)) break;
-        if (!state.recipients.some((r) => String(r.id) === who)) break;
+        if (!peerRecipients().some((r) => String(r.id) === who)) break;
 
         const live = new Set(state.peerLive);
         if (event.status === 'online') {
