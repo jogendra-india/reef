@@ -1597,6 +1597,25 @@
 
   /* ---- Invitations ---------------------------------------------------- */
 
+  /* Records a room the server has just seated this browser in.
+   *
+   * Starting a conversation creates a new room, and this client only ever
+   * learned about a room from an unlock response — so the room you had just
+   * created was invisible to you until you re-entered your PIN. The server now
+   * enrols the calling device and hands back that room's token, which is
+   * everything needed to treat it like any other conversation immediately. */
+  async function adoptRoom(result) {
+    if (!result || !result.room_id || !result.token) return false;
+    state.sessions[result.room_id] = {
+      token: result.token,
+      deviceId: result.device && result.device.id,
+      status: (result.device && result.device.status) || 'active',
+      slot: result.slot || 1,
+    };
+    await DB.setSessions(state.sessions);
+    return true;
+  }
+
   async function refreshRequests() {
     try {
       state.requests = (await API.requests()).invitations || [];
@@ -1747,11 +1766,12 @@
       send.style.justifyContent = 'center';
       send.addEventListener('click', async () => {
         try {
-          await API.inviteByCode(input.value);
+          // The server seats this browser in the pending room, so the
+          // conversation is reachable from "Switch conversation" the moment they
+          // accept — no second trip through the PIN.
+          await adoptRoom(await API.inviteByCode(input.value));
           closeSheet();
-          // Same trap as a join PIN: accepting creates a new room, and this
-          // device is only enrolled in it at the next unlock.
-          toast('Sent. Once they accept, enter your PIN again to see it.');
+          toast('Sent. It appears once they accept.');
         } catch (err) {
           toast(err.status === 404 ? 'No such code' : (err.message || 'Failed'));
         }
@@ -1770,6 +1790,7 @@
       newcomer.addEventListener('click', async () => {
         try {
           const result = await API.inviteNewcomer();
+          await adoptRoom(result);
           closeSheet();
           showJoinPin(result);
         } catch (e) {
@@ -1803,27 +1824,32 @@
       });
       sheet.appendChild(copy);
 
-      // This is the step that was missing, and it is not optional. An invitation
-      // puts your seat in a *new* room, and a device is enrolled per room at
-      // unlock — so until the PIN is entered again this browser has no device
-      // there and the conversation cannot appear. Skipping it leaves both people
-      // staring at "the other side has no approved device yet", which is the
-      // symptom with the least obvious cause in the whole app.
-      sheet.appendChild(
-        el(
-          'div',
-          'sheet-title',
-          'This conversation is a new one, so enter your PIN again once they ' +
-            'have joined — until you do, this device is not in it.'
-        )
-      );
-      const relock = el('button', 'act', 'Enter my PIN again');
-      relock.style.cssText += ';justify-content:center;color:var(--accent)';
-      relock.addEventListener('click', () => {
-        closeSheet();
-        lockNow();
-      });
-      sheet.appendChild(relock);
+      // An invitation puts your seat in a *new* room. This browser is now
+      // enrolled in it by the server, so it can simply be opened — previously
+      // there was no device there and the only way in was to re-enter the PIN,
+      // which nothing told you, and both people ended up staring at "the other
+      // side has no approved device yet".
+      if (result.room_id && state.sessions[result.room_id]) {
+        sheet.appendChild(
+          el(
+            'div',
+            'sheet-title',
+            'This is a new conversation. Wait for them in it — they appear as ' +
+              'soon as they have joined.'
+          )
+        );
+        const go = el('button', 'act', 'Go to that conversation');
+        go.style.cssText += ';justify-content:center;color:var(--accent)';
+        go.addEventListener('click', async () => {
+          closeSheet();
+          try {
+            await enterRoom(result.room_id);
+          } catch (e) {
+            toast('Could not open it — enter your PIN again');
+          }
+        });
+        sheet.appendChild(go);
+      }
     });
   }
 
@@ -1844,17 +1870,23 @@
           button.style.cssText = `color:${colour};font-weight:600;padding:8px 10px`;
           button.addEventListener('click', async () => {
             try {
-              await API.respondToRequest(invitation.id, action);
+              // Accepting enrols this browser in the room, so it can be opened
+              // straight away rather than after another unlock.
+              const outcome = await API.respondToRequest(invitation.id, action);
+              const joined = action === 'accept' && (await adoptRoom(outcome));
               closeSheet();
               await refreshRequests();
               toast(done);
+              if (joined) await enterRoom(outcome.room_id);
             } catch (e) {
               toast('Could not do that');
             }
           });
           return button;
         };
-        row.appendChild(respond('accept', 'var(--accent)', 'Accepted — lock and unlock to see it.'));
+        // No longer "lock and unlock to see it" — accepting enrols this device,
+        // so the conversation opens directly.
+        row.appendChild(respond('accept', 'var(--accent)', 'Accepted.'));
         row.appendChild(respond('decline', 'var(--danger)', 'Declined.'));
         sheet.appendChild(row);
       });
