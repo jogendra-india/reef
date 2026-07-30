@@ -894,8 +894,15 @@
       tick.textContent = '⚠ not sent — tap to retry';
       tick.style.cssText = 'color:var(--danger);font-weight:600;letter-spacing:0';
     } else {
-      const read = (message.receipts || []).some((r) => r.read_at);
-      const delivered = (message.receipts || []).some((r) => r.delivered_at);
+      // Only the other person's receipts are an answer to "have they seen it".
+      // A revoked peer device is not in `recipients` any more but its receipt
+      // still counts, which is why this asks whether the device is *ours*
+      // rather than whether it is a current peer.
+      const theirs = (message.receipts || []).filter(
+        (r) => !isOwnDevice(r.device_id)
+      );
+      const read = theirs.some((r) => r.read_at);
+      const delivered = theirs.some((r) => r.delivered_at);
       tick.textContent = delivered || read ? '✓✓' : '✓';
       if (read) tick.classList.add('read');
     }
