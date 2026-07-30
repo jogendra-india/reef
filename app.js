@@ -729,10 +729,18 @@
       node.alt = '';
       node.loading = 'lazy';
     }
-    node.style.minHeight = '120px';
     if (file && file.w && file.h) {
+      // The attributes reserve the right space before the blob decrypts; the
+      // explicit ratio holds the shape even while the box is still empty. Both
+      // rely on `height:auto` in the stylesheet — without it the height
+      // attribute pins the box and the picture stretches.
       node.width = file.w;
       node.height = file.h;
+      node.style.aspectRatio = `${file.w} / ${file.h}`;
+    } else {
+      // No dimensions to work from, so reserve a little room and let the image
+      // settle once it loads.
+      node.classList.add('sizeless');
     }
     if (file) {
       // Decrypt only once it is close to the viewport — a long scroll should
@@ -743,7 +751,9 @@
       node._message = message;
     }
     if (!isVideo) {
-      node.addEventListener('click', () => node.src && openViewer(node.src, file));
+      // The attachment, not node.src. Handing over the src meant handing over
+      // the *thumbnail* — 320px upscaled to fill the screen.
+      node.addEventListener('click', () => openViewer(attachment, file));
     }
     return node;
   }
@@ -759,31 +769,45 @@
     { rootMargin: '400px' }
   );
 
+  /* Decrypts one attachment and hands back a URL for it.
+   *
+   * Thumbnail and full size are cached under separate keys. They used to share
+   * `attachment.id`, so whichever loaded first answered for both — which is
+   * also why opening a picture could never show more detail than the thumbnail
+   * already on screen.
+   *
+   * The cache holds Blobs, not object URLs. A `blob:` URL belongs to the
+   * document that made it and is dead the moment the page reloads, so the old
+   * cache handed back strings that pointed at nothing and the image simply
+   * never appeared. Anything not a Blob is treated as a miss, which quietly
+   * retires those entries. */
+  async function mediaUrl(attachment, file, wantFull) {
+    const useThumb = !wantFull && !!attachment.has_thumb;
+    const cacheKey = attachment.id + (useThumb ? ':thumb' : ':full');
+    let blob = await DB.get(DB.STORES.media, cacheKey);
+    if (!(blob instanceof Blob)) {
+      const bytes = await API.fetchBlob(attachment.id, useThumb);
+      const plain = await C.openBlob(
+        new Uint8Array(bytes),
+        useThumb ? file.thumbKey : file.key,
+        useThumb ? file.thumbIv : file.iv
+      );
+      blob = new Blob([plain], { type: file.mime || 'image/jpeg' });
+      await DB.put(DB.STORES.media, blob, cacheKey);
+    }
+    return URL.createObjectURL(blob);
+  }
+
   async function paintMedia(node) {
     const file = node._file;
     const attachment = node._attachment;
     if (!file || !attachment) return;
-    const cacheKey = attachment.id;
-    let url = await DB.get(DB.STORES.media, cacheKey);
-    if (!url) {
-      try {
-        const bytes = await API.fetchBlob(
-          attachment.id,
-          attachment.has_thumb && !node._full
-        );
-        const plain = await C.openBlob(
-          new Uint8Array(bytes),
-          attachment.has_thumb && !node._full ? file.thumbKey : file.key,
-          attachment.has_thumb && !node._full ? file.thumbIv : file.iv
-        );
-        const blob = new Blob([plain], { type: file.mime || 'image/jpeg' });
-        url = URL.createObjectURL(blob);
-      } catch (e) {
-        return;
-      }
+    try {
+      node.src = await mediaUrl(attachment, file, !!node._full);
+      node.classList.remove('pending');
+    } catch (e) {
+      /* offline, or sealed for a key this device does not have */
     }
-    node.src = url;
-    node.classList.remove('pending');
   }
 
   /* Movement only. Nothing here counts as "the reader has caught up". */
@@ -1138,7 +1162,11 @@
     );
   }
 
-  function openViewer(src, file) {
+  // Bumped on every open, so a slow full-size decrypt cannot land in a viewer
+  // that has since moved on to a different picture.
+  let viewerOpen = 0;
+
+  async function openViewer(attachment, file) {
     const viewer = $('viewer');
     [...viewer.querySelectorAll('img,video')].forEach((n) => n.remove());
     const isVideo = !!file && String(file.mime || '').startsWith('video/');
@@ -1148,9 +1176,31 @@
       node.playsInline = true;
       node.autoplay = true;
     }
-    node.src = src;
     viewer.appendChild(node);
     viewer.classList.add('on');
+    const mine = ++viewerOpen;
+
+    // The thumbnail first when there is one, because it is already local and
+    // puts something on screen immediately rather than a black rectangle.
+    if (!isVideo && attachment.has_thumb) {
+      try {
+        const quick = await mediaUrl(attachment, file, false);
+        if (mine === viewerOpen) node.src = quick;
+      } catch (e) {
+        /* the full size below is the one that matters */
+      }
+    }
+
+    try {
+      // Full resolution — the entire reason for opening it.
+      const url = await mediaUrl(attachment, file, true);
+      if (mine === viewerOpen) node.src = url;
+    } catch (e) {
+      if (mine === viewerOpen && !node.src) {
+        viewer.classList.remove('on');
+        toast('Could not open that at full size');
+      }
+    }
   }
 
   /* ==================================================================== *

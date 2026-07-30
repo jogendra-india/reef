@@ -128,7 +128,17 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
        max-height:52px;overflow:hidden;}
 .bubble.gone .txt{font-style:italic;color:var(--muted);}
 
-.media{display:block;max-width:100%;border-radius:12px;margin-bottom:4px;background:#0a1a20;}
+/* height:auto is the important one. app.js sets width *and* height attributes
+   from the real pixel size so the browser can reserve the right space before
+   the blob decrypts — but with max-width shrinking the width to the bubble and
+   the height attribute left standing, every image in the thread was stretched
+   vertically. object-fit is the backstop for any box that still ends up the
+   wrong shape. */
+.media{display:block;max-width:100%;height:auto;object-fit:contain;
+       border-radius:12px;margin-bottom:4px;background:#0a1a20;}
+/* Only for attachments that arrived without dimensions. A blanket min-height
+   stretched anything shorter than it. */
+.media.sizeless{min-height:120px;}
 .media.pending{filter:blur(8px);}
 .reacts{display:flex;gap:3px;margin-top:4px;}
 .react{background:var(--surface);border:1px solid var(--line);border-radius:11px;
@@ -198,7 +208,9 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 #viewer{position:fixed;inset:0;background:#000;z-index:20;display:none;
         align-items:center;justify-content:center;touch-action:none;}
 #viewer.on{display:flex;}
-#viewer img,#viewer video{max-width:100%;max-height:100%;}
+/* dvh rather than %, so a mobile toolbar sliding away actually gives the image
+   the space. contain keeps it honest at any window shape. */
+#viewer img,#viewer video{max-width:100vw;max-height:100dvh;object-fit:contain;}
 #viewer .close{position:absolute;top:calc(var(--safe-top) + 8px);right:8px;font-size:22px;color:#fff;}
 
 /* ---------------- Privacy blur ---------------- */
