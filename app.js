@@ -1006,6 +1006,15 @@
     } else {
       node.alt = '';
       node.loading = 'lazy';
+      // Decrypted perfectly and still unrenderable: HEIC is the usual reason, and
+      // an iPhone hands that over whenever a photo comes from Files rather than
+      // the camera roll. A row that hands the file over beats a broken image, and
+      // this catches every other cause of one for free.
+      node.addEventListener('error', () => {
+        if (node._swapped || !node.src) return;
+        node._swapped = true;
+        node.replaceWith(renderFile(attachment, file));
+      });
     }
     if (file && file.w && file.h) {
       // The attributes reserve the right space before the blob decrypts; the
@@ -1507,18 +1516,36 @@
     autogrow();
   }
 
+  async function asIs(file) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    return {
+      bytes,
+      mime: file.type || 'application/octet-stream',
+      name: file.name || 'file',
+      size: file.size,
+    };
+  }
+
   async function prepareAttachment(file) {
     // Anything that is not an image travels as-is: no canvas, no thumbnail, and
     // its real name and type kept so the other side can save it as itself.
-    if (!file.type.startsWith('image/')) {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      return {
-        bytes,
-        mime: file.type || 'application/octet-stream',
-        name: file.name || 'file',
-        size: file.size,
-      };
+    if (!file.type.startsWith('image/')) return asIs(file);
+
+    // An image the browser cannot decode still deserves to be sent. iPhones hand
+    // over HEIC when a photo comes from Files rather than the camera roll, and
+    // createImageBitmap refuses it on some versions of Safari — which used to
+    // drop the file entirely and leave only a toast behind. Sending the original
+    // bytes loses the resize and the EXIF strip, so it is second choice, not
+    // first.
+    try {
+      return await resizedImage(file);
+    } catch (e) {
+      if (file.size > MAX_ATTACHMENT) throw e; // too big to send unresized
+      return asIs(file);
     }
+  }
+
+  async function resizedImage(file) {
     const bitmap = await createImageBitmap(file);
     // Re-encoding through a canvas resizes and strips EXIF in one step. The
     // server cannot do either — it only ever sees ciphertext.
