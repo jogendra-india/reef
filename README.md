@@ -64,8 +64,22 @@ python manage.py migrate reef
 python manage.py reef_init --pin1 481357 --pin2 726094   # pick your own
 ```
 
-Then each person opens the site, enters their PIN, and the other approves the
-new device from **menu → Devices**.
+Both PINs in **one** command — that is what seats the two people in the same
+room. Two separate runs give two separate conversations, and each person then
+finds nobody on the other side.
+
+No shell on the deploy? The same thing from Django admin, as a superuser:
+**Reef → Rooms → Add**, then **Reef → Reef users → Add** twice against that
+room, slot 1 and slot 2, a PIN each.
+
+Then each person opens the site and enters their PIN. The first device in a room
+that has no messages yet lets itself in; once anything has been said, every new
+device needs the other person to approve it from **menu → Devices**.
+
+Inviting from inside the app — **menu → Start a conversation** — always creates
+a *new* room for that pair, so a room seeded above and never used stays empty.
+Delete it from **Reef → Rooms** rather than leaving a conversation with nobody
+in it.
 
 ## Known limits
 
