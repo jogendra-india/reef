@@ -287,12 +287,38 @@
     state.sessions = sessions;
     state.mustChangePin = result.must_change_pin;
 
-    const preferred =
-      result.rooms.find((r) => r.device.status === 'active') || result.rooms[0];
+    const preferred = pickRoom(result.rooms);
     entry = '';
     paintDots();
     state.locked = false;
     await enterRoom(preferred.room_id, preferred);
+  }
+
+  /* Which conversation to open when a PIN opens several.
+   *
+   * This used to be "the first room where this device is active, else the first
+   * room", which sounds right and is how you end up staring at an empty
+   * conversation. A room seeded by hand, or the half-empty one an invite leaves
+   * behind, has an active device and nobody in it — and being older, it sorts
+   * first. The room with the other person in it lost every time, and the only
+   * way out was to know that "Switch conversation" existed.
+   *
+   * So: somewhere with a person beats somewhere without one, and among those,
+   * one this device can already read beats one still waiting for approval. */
+  function pickRoom(rooms) {
+    const peersIn = (room) =>
+      (((room.session || {}).peer_devices) || []).filter(
+        (d) => d.status === 'active'
+      ).length;
+    const rank = (room) => {
+      const mine = room.device.status === 'active';
+      if (mine && peersIn(room)) return 3;
+      if (peersIn(room)) return 2; // someone is there; this device needs letting in
+      if (mine) return 1; // ours to read, but empty
+      return 0;
+    };
+    // Stable, so rooms of equal rank keep the server's order — oldest first.
+    return [...rooms].sort((a, b) => rank(b) - rank(a))[0];
   }
 
   /* Makes one conversation the active one. Everything room-scoped is torn down
@@ -907,6 +933,17 @@
     const strip = $('peer-missing');
     const missing = !state.recipients.length;
     strip.style.display = missing ? 'flex' : 'none';
+    if (missing) {
+      // Saying only "nothing can be sent" left nothing to do about it. When a
+      // conversation with somebody in it is one tap away, say so — this is the
+      // exact state a leftover half-empty room produces.
+      const elsewhere = Object.keys(state.sessions).length > 1;
+      $('peer-missing-text').textContent = elsewhere
+        ? 'Nobody is in this conversation. You have another one — tap to switch.'
+        : 'The other side has no approved device yet — nothing can be sent.';
+      strip.style.cursor = elsewhere ? 'pointer' : '';
+      strip.onclick = elsewhere ? openRoomSheet : null;
+    }
     $('text').placeholder = missing
       ? 'Nobody to talk to yet'
       : 'Say something…';
