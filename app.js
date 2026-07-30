@@ -740,9 +740,22 @@
     if (message.reactions && message.reactions.length) {
       const reacts = el('div', 'reacts');
       message.reactions.forEach((reaction) => {
-        if (reaction.emoji) reacts.appendChild(el('span', 'react', reaction.emoji));
+        if (!reaction.emoji) return;
+        // Two people reacting produced two identical-looking chips with nothing
+        // to say which was whose. Yours is marked, and the rest is in Details.
+        const own = String(reaction.device_id) === String(state.device.id);
+        reacts.appendChild(
+          el('span', 'react' + (own ? ' own' : ''), reaction.emoji)
+        );
       });
-      if (reacts.children.length) bubble.appendChild(reacts);
+      if (reacts.children.length) {
+        reacts.title = 'Who reacted';
+        reacts.addEventListener('click', (event) => {
+          event.stopPropagation();
+          openInfoSheet(message);
+        });
+        bubble.appendChild(reacts);
+      }
     }
 
     if (message.state === 'failed') {
@@ -1611,7 +1624,80 @@
           action('🗑', 'Delete for everyone', () => removeMessage(message), true);
         }
       }
+      action('ℹ', 'Details', () => openInfoSheet(message));
       action('👁', 'Hide for me', () => hideLocally(message));
+    });
+  }
+
+  const stamp = (iso) =>
+    new Date(iso).toLocaleString(undefined, {
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+
+  /* Turns a device id into a person.
+   *
+   * Handles and fish never touch the server — they arrive as encrypted system
+   * messages — so this is the only place that can name anybody, and it has to
+   * cope with a device that has not announced itself yet, or one that has since
+   * been replaced. */
+  function whoIs(deviceId) {
+    const id = String(deviceId);
+    if (id === String(state.device.id)) return 'You';
+    const profile = state.profiles[deviceId] || state.profiles[id];
+    if (profile && profile.handle) {
+      return `${profile.emoji || ''} ${profile.handle}`.trim();
+    }
+    if (state.recipients.some((r) => String(r.id) === id)) {
+      const peer = peerProfile();
+      return peer.handle && peer.handle !== 'Reef' ? peer.handle : 'The other person';
+    }
+    return 'A device no longer here';
+  }
+
+  /* Everything the client knows about one message, which until now it kept to
+   * itself: the receipts were collapsed into one tick and the reactions into
+   * bare emoji, so "have they read it" and "who reacted" had no answer. */
+  function openInfoSheet(message) {
+    openSheet((sheet) => {
+      sheet.appendChild(el('div', 'sheet-title', 'When it went, and who has seen it.'));
+
+      const line = (label, value) => {
+        const row = el('div', 'act');
+        row.style.pointerEvents = 'none';
+        row.appendChild(el('span', null, label));
+        const right = el('span', null, value);
+        right.style.cssText = 'flex:1;text-align:right;color:var(--muted)';
+        row.appendChild(right);
+        sheet.appendChild(row);
+      };
+
+      line('Sent', stamp(message.createdAt));
+      if (message.editedAt) line('Edited', stamp(message.editedAt));
+      if (message.deleted) line('Taken back', 'yes');
+
+      if (message.mine) {
+        const receipts = (message.receipts || []).filter((r) => r.device_id);
+        if (!receipts.length) {
+          line('Delivered', message.state === 'sent' ? 'not yet' : 'still sending');
+        }
+        receipts.forEach((receipt) => {
+          const name = whoIs(receipt.device_id);
+          line(`Delivered · ${name}`, receipt.delivered_at ? stamp(receipt.delivered_at) : 'not yet');
+          line(`Read · ${name}`, receipt.read_at ? stamp(receipt.read_at) : 'not yet');
+        });
+      }
+
+      const reactions = (message.reactions || []).filter((r) => r.emoji);
+      if (reactions.length) {
+        sheet.appendChild(el('div', 'sheet-title', 'Reactions'));
+        reactions.forEach((reaction) => {
+          line(whoIs(reaction.device_id), reaction.emoji);
+        });
+      }
     });
   }
 

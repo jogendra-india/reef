@@ -141,8 +141,11 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .media.sizeless{min-height:120px;}
 .media.pending{filter:blur(8px);}
 .reacts{display:flex;gap:3px;margin-top:4px;}
+.reacts{cursor:pointer;}
 .react{background:var(--surface);border:1px solid var(--line);border-radius:11px;
        padding:1px 6px;font-size:13px;}
+/* Yours, so two identical emoji are still telling you something. */
+.react.own{border-color:var(--accent);}
 
 .pill{position:absolute;left:50%;transform:translateX(-50%);bottom:calc(100% + 10px);
       background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:600;
