@@ -1199,6 +1199,158 @@
     );
   }
 
+  /* Pinch, drag and double-tap inside the viewer.
+   *
+   * The viewer is `touch-action:none`, which is what stops a pinch from scrolling
+   * the thread underneath — and also what stopped it from zooming anything. So
+   * the gesture is driven here rather than left to the browser, which has the
+   * side benefit of working the same on a trackpad, a mouse wheel and a phone.
+   *
+   * Panning is clamped to the picture's own edges, because a photo that can be
+   * flung off-screen and lost is worse than one that cannot be moved at all. */
+  function attachZoom(viewer, node) {
+    const MAX = 6;
+    let scale = 1;
+    let tx = 0;
+    let ty = 0;
+    const points = new Map();
+    let from = null; // gesture start: distance, midpoint, scale, offset
+    let dragged = false;
+    let lastTap = 0;
+
+    const paint = () => {
+      node.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+      node.style.cursor = scale > 1 ? 'grab' : '';
+    };
+
+    // offsetWidth is the laid-out size, unaffected by the transform, so the
+    // bounds do not drift as the picture is scaled.
+    const contain = () => {
+      scale = Math.min(MAX, Math.max(1, scale));
+      if (scale === 1) {
+        tx = 0;
+        ty = 0;
+        return;
+      }
+      const slackX = Math.max(0, (node.offsetWidth * scale - window.innerWidth) / 2);
+      const slackY = Math.max(0, (node.offsetHeight * scale - window.innerHeight) / 2);
+      tx = Math.min(slackX, Math.max(-slackX, tx));
+      ty = Math.min(slackY, Math.max(-slackY, ty));
+    };
+
+    /* Zoom about a point, so the pixel under the fingers stays under them. */
+    const zoomAt = (next, cx, cy) => {
+      next = Math.min(MAX, Math.max(1, next));
+      const originX = cx - window.innerWidth / 2;
+      const originY = cy - window.innerHeight / 2;
+      const ratio = next / scale;
+      tx = originX - (originX - tx) * ratio;
+      ty = originY - (originY - ty) * ratio;
+      scale = next;
+      contain();
+      paint();
+    };
+
+    const mid = () => {
+      const all = [...points.values()];
+      return {
+        x: all.reduce((s, p) => s + p.x, 0) / all.length,
+        y: all.reduce((s, p) => s + p.y, 0) / all.length,
+      };
+    };
+    const spread = () => {
+      const [a, b] = [...points.values()];
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    };
+
+    viewer.addEventListener('pointerdown', (event) => {
+      points.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      dragged = false;
+      from = {
+        dist: points.size === 2 ? spread() : 0,
+        mid: mid(),
+        scale,
+        tx,
+        ty,
+      };
+    });
+
+    viewer.addEventListener('pointermove', (event) => {
+      if (!points.has(event.pointerId) || !from) return;
+      points.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      const here = mid();
+
+      if (points.size >= 2 && from.dist) {
+        const next = from.scale * (spread() / from.dist);
+        tx = from.tx + (here.x - from.mid.x);
+        ty = from.ty + (here.y - from.mid.y);
+        scale = next;
+        dragged = true;
+        contain();
+        paint();
+        return;
+      }
+
+      if (scale > 1) {
+        tx = from.tx + (here.x - from.mid.x);
+        ty = from.ty + (here.y - from.mid.y);
+        if (Math.abs(here.x - from.mid.x) > 4 || Math.abs(here.y - from.mid.y) > 4) {
+          dragged = true;
+        }
+        contain();
+        paint();
+      }
+    });
+
+    const release = (event) => {
+      points.delete(event.pointerId);
+      if (points.size === 1) {
+        // Going from two fingers to one: re-anchor, or the picture jumps.
+        from = { dist: 0, mid: mid(), scale, tx, ty };
+        return;
+      }
+      if (points.size) return;
+      from = null;
+
+      if (dragged) {
+        // Suppress the click this gesture is about to produce, so finishing a
+        // pan over the backdrop does not also close the viewer.
+        viewer._swallowClick = true;
+        return;
+      }
+
+      const now = Date.now();
+      if (now - lastTap < 300) {
+        lastTap = 0;
+        viewer._swallowClick = true;
+        zoomAt(scale > 1 ? 1 : 2.5, event.clientX, event.clientY);
+        return;
+      }
+      lastTap = now;
+    };
+
+    viewer.addEventListener('pointerup', release);
+    viewer.addEventListener('pointercancel', release);
+
+    // Trackpad pinch arrives as a wheel event with ctrlKey set; a plain wheel is
+    // a mouse. Both should zoom here — there is nothing else to scroll.
+    viewer.addEventListener(
+      'wheel',
+      (event) => {
+        event.preventDefault();
+        zoomAt(scale * Math.exp(-event.deltaY / 300), event.clientX, event.clientY);
+      },
+      { passive: false }
+    );
+
+    node.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      zoomAt(scale > 1 ? 1 : 2.5, event.clientX, event.clientY);
+    });
+
+    paint();
+  }
+
   // Bumped on every open, so a slow full-size decrypt cannot land in a viewer
   // that has since moved on to a different picture.
   let viewerOpen = 0;
@@ -1215,6 +1367,7 @@
     }
     viewer.appendChild(node);
     viewer.classList.add('on');
+    if (!isVideo) attachZoom(viewer, node);
     const mine = ++viewerOpen;
 
     // The thumbnail first when there is one, because it is already local and
@@ -1250,6 +1403,9 @@
     let axis = null;
     let holdTimer = null;
     let moved = false;
+    // One sheet per gesture. On Android a long press fires contextmenu *and*
+    // trips the hold timer, and both want to open it.
+    let opened = false;
 
     const cancelHold = () => {
       clearTimeout(holdTimer);
@@ -1263,8 +1419,10 @@
         startY = event.clientY;
         axis = null;
         moved = false;
+        opened = false;
         holdTimer = setTimeout(() => {
-          if (!moved) {
+          if (!moved && !opened) {
+            opened = true;
             buzz(14);
             openMessageSheet(message);
           }
@@ -1309,7 +1467,19 @@
     };
     row.addEventListener('pointerup', release, { passive: true });
     row.addEventListener('pointercancel', release, { passive: true });
-    row.addEventListener('contextmenu', (event) => event.preventDefault());
+    row.addEventListener('contextmenu', (event) => {
+      // The native menu is still suppressed — it offers "Copy image", "Save
+      // as", "Search the web for…", none of which belong here. But suppressing
+      // it and putting nothing in its place left a desktop browser with no
+      // route to reply, edit, delete or react at all: every one of those lived
+      // behind a 480ms press-and-hold, which is a phone gesture nobody performs
+      // with a mouse. Right-click now opens the same sheet a long press does.
+      event.preventDefault();
+      cancelHold();
+      if (opened) return;
+      opened = true;
+      openMessageSheet(message);
+    });
   }
 
   /* ==================================================================== *
@@ -1457,6 +1627,29 @@
     );
     paintBadge();
     paintDeviceBanner();
+
+    // The derived keys are the thing the composer actually depends on, and they
+    // were only ever rebuilt on unlock or on a device event. A device that let
+    // itself in — the first one into a room with no messages — sent no event, so
+    // this side could sit with an empty recipient list insisting the other side
+    // had nobody, while they were plainly there. Comparing the two lists catches
+    // it however the device arrived, and however the event went missing.
+    const peersNow = state.devices
+      .filter((d) => d.status === 'active' && d.slot !== state.session.slot)
+      .map((d) => String(d.id))
+      .sort()
+      .join(',');
+    const peersKnown = state.recipients
+      .map((r) => String(r.id))
+      .sort()
+      .join(',');
+    if (peersNow !== peersKnown) {
+      try {
+        await refreshKeys();
+      } catch (e) {
+        /* offline; the next pass will try again */
+      }
+    }
   }
 
   let devicesTimer = null;
@@ -2388,6 +2581,12 @@
     });
     $('viewer-close').addEventListener('click', () => $('viewer').classList.remove('on'));
     $('viewer').addEventListener('click', (event) => {
+      // A pinch or a pan ends in a click. Closing on it would mean the viewer
+      // shut itself the moment you finished moving the picture.
+      if ($('viewer')._swallowClick) {
+        $('viewer')._swallowClick = false;
+        return;
+      }
       if (event.target.id === 'viewer') $('viewer').classList.remove('on');
     });
     // Re-runs unlock with the *same* device id, so the server can reconsider a
