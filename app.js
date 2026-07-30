@@ -912,14 +912,88 @@
   function preview(message) {
     const body = message.body || {};
     if (body.text) return body.text.slice(0, 90);
+    const files = body.files || [];
+    if (files.length) {
+      // Name it. "📎 attachment" told you nothing about which one you were
+      // replying to.
+      const first = files[0];
+      const mime = String(first.mime || '');
+      const icon = mime.startsWith('image/')
+        ? '📷'
+        : mime.startsWith('video/')
+          ? '🎬'
+          : fileIcon(mime);
+      const label = mime.startsWith('image/') ? 'Photo' : first.name || 'file';
+      return files.length > 1 ? `${icon} ${label} +${files.length - 1}` : `${icon} ${label}`;
+    }
     if (message.attachments && message.attachments.length) return '📎 attachment';
     return 'a message';
+  }
+
+  const FILE_ICONS = [
+    [/pdf/, '📕'],
+    [/zip|rar|7z|tar|gzip/, '🗜'],
+    [/sheet|excel|csv/, '📊'],
+    [/word|document|rtf$/, '📝'],
+    [/presentation|powerpoint/, '📈'],
+    [/^audio\//, '🎵'],
+    [/^text\//, '📄'],
+    [/json|xml|javascript|x-sh|x-python/, '⌨️'],
+  ];
+  const fileIcon = (mime) => {
+    const found = FILE_ICONS.find(([pattern]) => pattern.test(mime || ''));
+    return found ? found[1] : '📎';
+  };
+
+  /* Anything that is not a picture or a video. Rendering these through an <img>
+   * decrypted the blob perfectly and then showed a broken image, so they get a
+   * row that says what they are and hands the file over on tap. */
+  function renderFile(attachment, file) {
+    const node = el('button', 'file');
+    node.type = 'button';
+    node.appendChild(el('span', 'ico', fileIcon(file.mime)));
+    const stack = el('div', 'grow');
+    stack.appendChild(el('b', null, file.name || 'file'));
+    const detail = [fileSize(file.size), (file.mime || '').split('/').pop()]
+      .filter(Boolean)
+      .join(' · ');
+    stack.appendChild(el('span', null, detail || 'file'));
+    node.appendChild(stack);
+    node.appendChild(el('span', 'ico', '⬇'));
+
+    node.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      node.disabled = true;
+      try {
+        // Decrypted here and handed to the browser as a download — the bytes
+        // never exist in the clear anywhere else.
+        const url = await mediaUrl(attachment, file, true);
+        const link = el('a');
+        link.href = url;
+        link.download = file.name || 'file';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      } catch (e) {
+        toast('Could not open that file');
+      } finally {
+        node.disabled = false;
+      }
+    });
+    return node;
   }
 
   function renderMedia(attachment, file, message) {
     // Video used to be forced through an <img>, which decrypted the blob
     // perfectly and then displayed nothing at all.
-    const isVideo = !!file && String(file.mime || '').startsWith('video/');
+    const mime = String((file && file.mime) || '');
+    const isVideo = mime.startsWith('video/');
+    // Only pictures and video belong in an <img>/<video>. Everything else — a
+    // PDF, a spreadsheet, an archive — used to be forced through one and drew a
+    // broken image.
+    if (file && !isVideo && !mime.startsWith('image/')) {
+      return renderFile(attachment, file);
+    }
     const node = el(isVideo ? 'video' : 'img', 'media pending');
     if (isVideo) {
       node.controls = true;
@@ -1328,23 +1402,62 @@
    * Media capture
    * ==================================================================== */
 
+  // Mirrors MAX_ATTACHMENT_BYTES on the server, less a little room: encryption
+  // adds an authentication tag, so the ciphertext is a touch larger than what
+  // goes in. Catching it here gives a sentence naming the file instead of a 413
+  // after a long upload.
+  const MAX_ATTACHMENT = 25 * 1024 * 1024 - 8192;
+
+  const fileSize = (bytes) => {
+    if (!bytes) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let n = bytes;
+    let unit = 0;
+    while (n >= 1024 && unit < units.length - 1) {
+      n /= 1024;
+      unit++;
+    }
+    return `${n < 10 && unit > 0 ? n.toFixed(1) : Math.round(n)} ${units[unit]}`;
+  };
+
   async function onFiles(fileList) {
     for (const file of [...fileList]) {
+      // Checked on the original: an image is re-encoded smaller below, so
+      // judging it before that would refuse photos the server would have taken.
+      if (!file.type.startsWith('image/') && file.size > MAX_ATTACHMENT) {
+        toast(`${file.name} is too big — ${fileSize(file.size)}, limit is 25 MB`);
+        continue;
+      }
       try {
-        const prepared = await prepareImage(file);
+        const prepared = await prepareAttachment(file);
+        if (prepared.bytes.length > MAX_ATTACHMENT) {
+          toast(`${file.name} is too big even after resizing`);
+          continue;
+        }
         pendingFiles.push(prepared);
-        toast(`${pendingFiles.length} attached`);
+        toast(
+          pendingFiles.length === 1
+            ? `${prepared.name} attached`
+            : `${pendingFiles.length} attached`
+        );
       } catch (e) {
-        toast('Could not read that file');
+        toast(`Could not read ${file.name || 'that file'}`);
       }
     }
     autogrow();
   }
 
-  async function prepareImage(file) {
+  async function prepareAttachment(file) {
+    // Anything that is not an image travels as-is: no canvas, no thumbnail, and
+    // its real name and type kept so the other side can save it as itself.
     if (!file.type.startsWith('image/')) {
       const bytes = new Uint8Array(await file.arrayBuffer());
-      return { bytes, mime: file.type, name: file.name, size: file.size };
+      return {
+        bytes,
+        mime: file.type || 'application/octet-stream',
+        name: file.name || 'file',
+        size: file.size,
+      };
     }
     const bitmap = await createImageBitmap(file);
     // Re-encoding through a canvas resizes and strips EXIF in one step. The

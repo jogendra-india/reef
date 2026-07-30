@@ -144,6 +144,16 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
    stretched anything shorter than it. */
 .media.sizeless{min-height:120px;}
 .media.pending{filter:blur(8px);}
+/* Anything that is not a picture or a video: a row that says what it is and
+   hands it over on tap, rather than a broken <img>. */
+.file{display:flex;align-items:center;gap:10px;width:100%;text-align:left;
+      padding:8px 10px;margin-bottom:4px;border-radius:12px;
+      background:#ffffff12;color:inherit;cursor:pointer;}
+.file .ico{font-size:22px;flex:0 0 auto;}
+.file .grow{flex:1;min-width:0;}
+.file b{display:block;font-weight:600;font-size:14px;
+        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.file span{display:block;font-size:12px;opacity:.75;}
 .reacts{display:flex;gap:3px;margin-top:4px;}
 .reacts{cursor:pointer;}
 .react{background:var(--surface);border:1px solid var(--line);border-radius:11px;
@@ -322,7 +332,9 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         <button id="send" aria-label="Send" disabled>➤</button>
       </div>
       <div id="emoji"></div>
-      <input type="file" id="file-input" accept="image/*,video/*" hidden multiple>
+      <!-- No accept filter: the server never sees a mime type, it is inside the
+           encrypted descriptor, so there is nothing for it to object to. -->
+      <input type="file" id="file-input" hidden multiple>
     </div>
   </section>
 
