@@ -1576,7 +1576,15 @@
         action('📨', `Requests (${waiting})`, openRequestsSheet);
       }
       action('🏷', 'My code', openCodeSheet);
-      action('✉️', 'Start a conversation', openInviteSheet);
+      // "Start a conversation" was ambiguous about whether it joined this one or
+      // began another. It now depends on where you are: an empty seat here gets
+      // filled, and only a full room starts something separate. The label says
+      // which.
+      action(
+        '✉️',
+        state.recipients.length ? 'Start a new conversation' : 'Invite someone here',
+        openInviteSheet
+      );
       if (Object.keys(state.sessions).length > 1) {
         action('🔀', 'Switch conversation', openRoomSheet);
       }
@@ -1749,6 +1757,22 @@
 
   function openInviteSheet() {
     openSheet((sheet) => {
+      // Say up front where the person will land. The server fills the free seat
+      // in this room when there is one and nothing has been said yet, and only
+      // starts a separate conversation otherwise.
+      const here = !state.recipients.length;
+      const lede = el(
+        'div',
+        'sheet-title',
+        here
+          ? 'Nobody else is in this conversation yet, so whoever you invite ' +
+            'joins you here.'
+          : 'This starts a separate conversation. The one you are in now is ' +
+            'untouched.'
+      );
+      lede.style.color = 'var(--text)';
+      sheet.appendChild(lede);
+
       sheet.appendChild(
         el('div', 'sheet-title', 'Someone already using Reef — enter their code.')
       );
@@ -1824,12 +1848,17 @@
       });
       sheet.appendChild(copy);
 
-      // An invitation puts your seat in a *new* room. This browser is now
-      // enrolled in it by the server, so it can simply be opened — previously
-      // there was no device there and the only way in was to re-enter the PIN,
-      // which nothing told you, and both people ended up staring at "the other
-      // side has no approved device yet".
-      if (result.room_id && state.sessions[result.room_id]) {
+      if (result.same_room) {
+        // The free seat in this very room was filled, so there is nowhere to go.
+        sheet.appendChild(
+          el(
+            'div',
+            'sheet-title',
+            'They join this conversation — they appear here as soon as they ' +
+              'have entered it.'
+          )
+        );
+      } else if (result.room_id && state.sessions[result.room_id]) {
         sheet.appendChild(
           el(
             'div',
