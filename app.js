@@ -1556,7 +1556,9 @@
         try {
           await API.inviteByCode(input.value);
           closeSheet();
-          toast('Sent. It appears once they accept.');
+          // Same trap as a join PIN: accepting creates a new room, and this
+          // device is only enrolled in it at the next unlock.
+          toast('Sent. Once they accept, enter your PIN again to see it.');
         } catch (err) {
           toast(err.status === 404 ? 'No such code' : (err.message || 'Failed'));
         }
@@ -1607,6 +1609,28 @@
         toast('Copied');
       });
       sheet.appendChild(copy);
+
+      // This is the step that was missing, and it is not optional. An invitation
+      // puts your seat in a *new* room, and a device is enrolled per room at
+      // unlock — so until the PIN is entered again this browser has no device
+      // there and the conversation cannot appear. Skipping it leaves both people
+      // staring at "the other side has no approved device yet", which is the
+      // symptom with the least obvious cause in the whole app.
+      sheet.appendChild(
+        el(
+          'div',
+          'sheet-title',
+          'This conversation is a new one, so enter your PIN again once they ' +
+            'have joined — until you do, this device is not in it.'
+        )
+      );
+      const relock = el('button', 'act', 'Enter my PIN again');
+      relock.style.cssText += ';justify-content:center;color:var(--accent)';
+      relock.addEventListener('click', () => {
+        closeSheet();
+        lockNow();
+      });
+      sheet.appendChild(relock);
     });
   }
 

@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v6';
-const BUILD = '2026-07-30c';
+const CACHE = 'reef-shell-v7';
+const BUILD = '2026-07-30d';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
