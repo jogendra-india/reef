@@ -244,6 +244,12 @@
     setSessions: (value) => putShared(value, 'sessions'),
     profile: () => getShared('me'),
     setProfile: (value) => putShared(value, 'me'),
+    // Shared rather than per-room, and deliberately: it is a property of this
+    // device, the service worker has to be able to read it with no page open,
+    // and muting one conversation while another shouts is not a thing anybody
+    // asked for.
+    notifications: () => getShared('notifications'),
+    setNotifications: (value) => putShared(value, 'notifications'),
     async wipeEverything() {
       // Signing out has to take the shared vault too, or the next person to
       // use this browser inherits its keys and tokens.

@@ -230,6 +230,23 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 @media (prefers-reduced-motion: reduce){
   *{animation:none!important;transition:none!important;}
 }
+
+/* ---------------- Wide screens ----------------
+   The thread was full-bleed at every width, so on a monitor one bubble sat hard
+   against the left edge and the reply hard against the right, with the eye
+   travelling the whole span between them — and a bubble at 78% of a very wide
+   viewport is a line of text nobody can follow.
+
+   Gutters rather than a max-width on a wrapper: the header, composer and their
+   borders stay attached to the window, while the content inside them lines up in
+   one readable column. */
+@media (min-width: 900px){
+  #hdr,#composer{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
+  #scroller{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
+  .banner{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
+  /* A share of the column, not of the monitor. */
+  .bubble{max-width:min(78%,560px);}
+}
 </style>
 </head>
 <body>

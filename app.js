@@ -69,6 +69,8 @@
     unseen: 0,
     devices: [],
     pendingDevices: [],
+    // Mirrors the stored setting so the menu can label the bell without an await.
+    notifications: true,
     build: null,
     hiddenAt: null,
     locked: true,
@@ -1734,6 +1736,12 @@
       if (Object.keys(state.sessions).length > 1) {
         action('🔀', 'Switch conversation', openRoomSheet);
       }
+      action(state.notifications ? '🔔' : '🔕',
+             state.notifications ? 'Notifications on' : 'Notifications off',
+             async () => {
+               await setNotifications(!state.notifications);
+               state.notifications = await notificationsOn();
+             });
       action('🔑', 'Safety number', openSafetySheet);
       action('🐠', 'Change my fish', openProfileSheet);
       action('📱', 'Devices', openDevicesSheet);
@@ -2470,6 +2478,7 @@
    * ==================================================================== */
 
   async function loadProfileSettings() {
+    state.notifications = await notificationsOn();
     // Shared across rooms: you are the same fish everywhere.
     const stored = await DB.profile();
     state.me = stored || DEFAULT_PROFILE[state.session.slot] || { handle: 'Fish', emoji: '🐟' };
@@ -2664,9 +2673,35 @@
    * Push
    * ==================================================================== */
 
+  /* Off means off: the subscription itself is dropped rather than a flag being
+   * set somewhere the server might ignore. Nothing can then be delivered to this
+   * device while the app is closed, which is the state the setting is for. The
+   * endpoint dies with it and the server retires it on the next 410. */
+  async function setNotifications(on) {
+    await DB.setNotifications(on ? 'on' : 'off');
+    if (on) {
+      await subscribePush();
+      toast('Notifications on');
+      return;
+    }
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) await subscription.unsubscribe();
+    } catch (e) {
+      /* nothing subscribed, or no push support: already silent */
+    }
+    toast('Notifications off — nothing will arrive while the app is closed');
+  }
+
+  const notificationsOn = async () => (await DB.notifications()) !== 'off';
+
   async function subscribePush() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
     if (!state.session.vapid_public_key) return;
+    // Asked for once and remembered. Re-subscribing on every unlock would
+    // silently undo the bell.
+    if (!(await notificationsOn())) return;
     try {
       const permission = await Notification.requestPermission();
       if (permission !== 'granted') return;

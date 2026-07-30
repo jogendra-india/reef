@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v12';
-const BUILD = '2026-07-30i';
+const CACHE = 'reef-shell-v13';
+const BUILD = '2026-07-30j';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -94,6 +94,8 @@ async function handlePush(event) {
     /* keep the generic path */
   }
 
+  // A device asking to join is the one thing worth interrupting for, so it is
+  // exempt from both the muting below and the open-window check.
   if (payload.kind === 'security') {
     return self.registration.showNotification('Reef', {
       body: payload.body || 'Something needs your attention.',
@@ -102,6 +104,21 @@ async function handlePush(event) {
       data: { url: payload.url || './' },
     });
   }
+
+  // Turned off in the app. The subscription is dropped when muting, so this
+  // should not arrive at all — but a push already in flight would, and honouring
+  // the setting here means "off" is never briefly untrue.
+  if ((await muted()) === true) return;
+
+  // The page is open and in front of the person. It received this over the
+  // WebSocket before this handler ran, so a notification is pure duplication —
+  // which is what made one appear while they were reading the conversation. The
+  // server also now skips connected devices, so this is the backstop.
+  const windows = await self.clients.matchAll({
+    type: 'window',
+    includeUncontrolled: true,
+  });
+  if (windows.some((client) => client.visibilityState === 'visible')) return;
 
   const generic = {
     title: 'Reef',
@@ -141,6 +158,16 @@ function show(content, payload) {
     vibrate: [60, 40, 60],
     data: { url: (payload && payload.url) || './' },
   });
+}
+
+/* Reads the notification setting out of the shared store, which is where it
+ * lives precisely so this worker can see it without a page open. */
+async function muted() {
+  try {
+    return (await self.ReefDB.notifications()) === 'off';
+  } catch (e) {
+    return false; // never swallow a message because the setting could not be read
+  }
 }
 
 async function decryptForNotification(messageId) {
