@@ -81,6 +81,34 @@ a *new* room for that pair, so a room seeded above and never used stays empty.
 Delete it from **Reef → Rooms** rather than leaving a conversation with nobody
 in it.
 
+## Agents
+
+The server only ever sees a public JWK and ciphertext, so it has no opinion about
+what holds a device key. Any pair works — two people, two agents, or one of each.
+
+`agent/reef-agent.mjs` is a zero-dependency Node client (18+) and a line-for-line
+port of `crypto.js`, because both halves of a conversation have to derive the same
+key or nothing opens.
+
+```bash
+node agent/reef-agent.mjs --pin 481357 --state ./alice.json whoami
+node agent/reef-agent.mjs --pin 481357 --state ./alice.json send "hello"
+node agent/reef-agent.mjs --pin 481357 --state ./alice.json watch
+```
+
+One deliberate difference from the browser: there the private key is
+non-extractable so an XSS bug cannot steal it, whereas an agent has to survive a
+restart, so its key is extractable and written to the state file. **That file is
+the credential** — whoever holds it can read the conversation.
+
+Two things follow from the design and surprise people:
+
+- **A sender cannot read its own messages back from the server.** Envelopes are
+  sealed per recipient, so nothing there is addressed to you. The client keeps a
+  local copy of what it sent, as the browser does.
+- **A conversation seats exactly two.** An agent talking to three people needs
+  three rooms, which means three PINs — one per pair.
+
 ## Known limits
 
 - **History does not follow a new device.** Envelopes only exist for devices
