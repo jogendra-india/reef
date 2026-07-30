@@ -518,6 +518,12 @@
       if (row.envelope && (!merged.body || merged.body.undecryptable)) {
         merged.body = await tryOpen(row);
       }
+      // No envelope for this device at all — every message sent before it
+      // existed. tryOpen never sees these, because there is nothing to attempt,
+      // so the body stayed undefined and renderRow drew a bubble containing a
+      // timestamp and nothing else. On a replacement device that was the entire
+      // history rendered as dozens of blank rows.
+      if (!merged.body && !merged.deleted) merged.body = { undecryptable: true };
       if (merged.deleted) merged.body = null;
       decoded.push(merged);
     }
@@ -650,6 +656,15 @@
     }
   }
 
+  /* Nothing readable and nothing to show: no text, no attachment, not deleted.
+   * A deleted message has its own honest line, so it is not this. */
+  function unreadable(message) {
+    if (message.deleted) return false;
+    const body = message.body || {};
+    if (body.undecryptable) return true;
+    return !body.text && !(message.attachments || []).length;
+  }
+
   const ordered = () =>
     [...state.messages.values()].sort((a, b) => (a.seq || 1e15) - (b.seq || 1e15));
 
@@ -663,7 +678,32 @@
     const visible = rows.slice(Math.max(0, rows.length - state.window));
 
     let lastDay = null;
-    visible.forEach((message, index) => {
+    for (let index = 0; index < visible.length; index++) {
+      const message = visible[index];
+
+      // A device only ever holds envelopes addressed to it, so a replacement
+      // starts with a whole history it cannot open. Fifty identical "can't open
+      // it" bubbles say the same thing fifty times and bury anything readable,
+      // so a run becomes one line. Kept out of the day-divider logic below,
+      // because the run can span days and a divider per day would defeat it.
+      if (unreadable(message)) {
+        let last = index;
+        while (last + 1 < visible.length && unreadable(visible[last + 1])) last++;
+        const count = last - index + 1;
+        list.appendChild(
+          el(
+            'div',
+            'sealed',
+            count === 1
+              ? 'One earlier message cannot be opened on this device'
+              : `${count} earlier messages cannot be opened on this device`
+          )
+        );
+        index = last;
+        lastDay = null; // the next real message re-states its day
+        continue;
+      }
+
       const day = dayLabel(message.createdAt);
       if (day !== lastDay) {
         list.appendChild(el('div', 'day', day));
@@ -682,7 +722,7 @@
         next.mine !== message.mine ||
         new Date(next.createdAt) - new Date(message.createdAt) >= 180000;
       list.appendChild(renderRow(message, { grouped, tail }));
-    });
+    }
 
     if (keepAnchor) {
       // Prepending without this is why so many such apps jerk when you scroll
@@ -2956,6 +2996,21 @@
     API.onUnauthorized(() => {
       // 401 means the device is gone for good, as opposed to 403 which only
       // means "not approved yet". Wipe rather than sit on dead state.
+      //
+      // Say why, though. This fires when a replacement device is approved —
+      // one active device per person, so the old one is retired — and the
+      // wipe-and-reload that followed looked like the app had lost the
+      // conversation for no reason. sessionStorage survives the reload and is
+      // not what gets wiped, which IndexedDB is.
+      try {
+        sessionStorage.setItem(
+          'reef-signed-out',
+          'This device was signed out, most likely because a newer one was ' +
+            'approved. Enter your PIN to use it again.'
+        );
+      } catch (e) {
+        /* private mode: the reload will just be silent */
+      }
       signOut();
     });
 
@@ -2990,6 +3045,20 @@
       }
     }
     showScreen('lock');
+    explainSignOut();
+  }
+
+  /* Carried across the reload that a revoked device triggers, so the lock screen
+   * can say what happened instead of just appearing. */
+  function explainSignOut() {
+    try {
+      const reason = sessionStorage.getItem('reef-signed-out');
+      if (!reason) return;
+      sessionStorage.removeItem('reef-signed-out');
+      $('lock-note').textContent = reason;
+    } catch (e) {
+      /* nothing to say */
+    }
   }
 
   boot();
