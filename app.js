@@ -60,6 +60,10 @@
     online: false,
     peerTyping: false,
     peerOnline: false,
+    // Which of the peer's devices are currently heartbeating. A flag was not
+    // enough: presence arrives per device, and a single boolean cannot tell
+    // "the peer left" from "some device somewhere sent an event".
+    peerLive: [],
     lastSeen: null,
     stickBottom: true,
     unseen: 0,
@@ -328,6 +332,7 @@
     if (state.stream) state.stream.close();
     state.stream = null;
     clearInterval(devicesTimer);
+    clearInterval(presenceTimer);
     state.messages = new Map();
     state.profiles = {};
     state.recipients = [];
@@ -336,6 +341,9 @@
     state.unseen = 0;
     state.devices = [];
     state.pendingDevices = [];
+    state.peerLive = [];
+    state.peerOnline = false;
+    state.lastSeen = null;
     paintDeviceBanner();
     clearReply();
     cancelEdit();
@@ -380,6 +388,9 @@
     await loadProfileSettings();
     await hydrateFromLocal();
     await refreshKeys();
+    // Before the stream, so the header is right from the first paint rather than
+    // waiting for an event that may never come.
+    seedPresence();
     connectStream();
     await syncHistory();
     await flushOutbox();
@@ -412,6 +423,7 @@
   async function signOut() {
     clearInterval(approvalTimer);
     clearInterval(devicesTimer);
+    clearInterval(presenceTimer);
     if (state.stream) state.stream.close();
     await DB.wipeEverything();
     location.reload();
@@ -564,6 +576,54 @@
     return (
       (recipient && state.profiles[recipient.id]) || { handle: 'Reef', emoji: '🐟' }
     );
+  }
+
+  /* The server heartbeats a device into a cache entry that expires after 45s,
+   * and reports the result as `last_seen` on every peer device in the session
+   * payload. This client never read it, and that is the whole of the bug where
+   * only one side ever showed as swimming.
+   *
+   * Presence was learned exclusively from live events, and an event only fires
+   * when a device connects or disconnects. The peer who was *already* connected
+   * announced nothing, so whoever loaded second saw them as "gone deep"
+   * forever — while the one already sitting there received the newcomer's
+   * announce and showed them as swimming. Refreshing swapped which side was
+   * blind, which is exactly how it looked: only ever one of them online. */
+  const PRESENCE_TTL = 45000;
+
+  function seedPresence() {
+    const peers = (state.session && state.session.peer_devices) || [];
+    const fresh = peers.filter(
+      (d) =>
+        d.status === 'active' &&
+        d.last_seen &&
+        Date.now() - new Date(d.last_seen).getTime() < PRESENCE_TTL
+    );
+    state.peerLive = fresh.map((d) => String(d.id));
+    state.peerOnline = state.peerLive.length > 0;
+    if (!state.peerOnline) {
+      const seen = peers
+        .map((d) => d.last_seen)
+        .filter(Boolean)
+        .sort();
+      if (seen.length) state.lastSeen = seen[seen.length - 1];
+    }
+    paintHeader();
+  }
+
+  /* Re-asks for the session, because presence cannot be inferred from silence.
+   * Needed on reconnect — any announce made while the socket was down is simply
+   * gone — and periodically, since a browser killed outright never sends the
+   * disconnect that would have cleared it. */
+  async function refreshPresence() {
+    try {
+      const result = await API.session();
+      state.session = Object.assign({}, state.session, result.session);
+      state.device = result.device || state.device;
+      seedPresence();
+    } catch (e) {
+      /* offline; the header already says so */
+    }
   }
 
   function paintHeader() {
@@ -1680,6 +1740,7 @@
   }
 
   let devicesTimer = null;
+  let presenceTimer = null;
 
   /* Slow, and only a safety net. device.pending over the WebSocket is the fast
    * path; this exists so a missed event — a reconnect, a server that never
@@ -1688,6 +1749,12 @@
   function watchDevices() {
     clearInterval(devicesTimer);
     devicesTimer = setInterval(refreshDevices, 60000);
+    clearInterval(presenceTimer);
+    // Deliberately shorter than the server's 45s presence window. A browser
+    // killed outright never sends the disconnect that would clear it, so
+    // "swimming" has to be able to lapse on its own rather than stay true until
+    // something else happens to correct it.
+    presenceTimer = setInterval(refreshPresence, 30000);
   }
 
   function paintDeviceBanner() {
@@ -2356,6 +2423,13 @@
         if (state.online) {
           syncHistory();
           flushOutbox();
+          // Any announce made while this socket was down is gone, so the peer's
+          // state has to be asked for rather than waited on.
+          refreshPresence();
+        } else {
+          // Our own socket is down; we know nothing about them any more.
+          state.peerLive = [];
+          state.peerOnline = false;
         }
       },
       onEvent: handleEvent,
@@ -2463,11 +2537,26 @@
         }
         break;
 
-      case 'presence':
-        state.peerOnline = event.status === 'online';
-        if (!state.peerOnline) state.lastSeen = event.at;
+      case 'presence': {
+        // The announce goes to the whole room, this device included, and it was
+        // applied without looking at whose it was — so a client showed the peer
+        // as swimming on the strength of its own connection.
+        const who = String(event.device_id || '');
+        if (!who || who === String(state.device.id)) break;
+        if (!state.recipients.some((r) => String(r.id) === who)) break;
+
+        const live = new Set(state.peerLive);
+        if (event.status === 'online') {
+          live.add(who);
+        } else {
+          live.delete(who);
+          state.lastSeen = event.at;
+        }
+        state.peerLive = [...live];
+        state.peerOnline = state.peerLive.length > 0;
         paintHeader();
         break;
+      }
 
       // The toast is the nudge, not the record. refreshDevices puts a dot on
       // the menu and a banner over the thread, both of which survive the 2.6
@@ -2550,6 +2639,7 @@
   function lockNow() {
     state.locked = true;
     clearInterval(devicesTimer);
+    clearInterval(presenceTimer);
     entry = '';
     paintDots();
     $('lock-note').textContent = '';
