@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v3';
-const BUILD = '2026-07-27c';
+const CACHE = 'reef-shell-v4';
+const BUILD = '2026-07-30a';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -144,12 +144,30 @@ function show(content, payload) {
 }
 
 async function decryptForNotification(messageId) {
-  const [session, identity] = await Promise.all([
-    self.ReefDB.session(),
+  // ReefDB has no session() — it never did. The call threw on every push, the
+  // throw was swallowed by handlePush, and every notification silently came out
+  // as the generic "New ripple" no matter what privacy setting was chosen.
+  const [sessions, identity] = await Promise.all([
+    self.ReefDB.sessions(),
     self.ReefDB.identity(),
   ]);
-  if (!session || !session.token || !identity) return null;
+  if (!identity) return null;
 
+  // The payload is a message id and nothing else, and one PIN can seat someone
+  // in several rooms, so the room this belongs to has to be found by asking.
+  for (const [roomId, session] of Object.entries(sessions || {})) {
+    if (!session || !session.token) continue;
+    try {
+      const detail = await lookInRoom(roomId, session, identity, messageId);
+      if (detail) return detail;
+    } catch (e) {
+      /* wrong room, or a key that cannot open it: try the next */
+    }
+  }
+  return null;
+}
+
+async function lookInRoom(roomId, session, identity, messageId) {
   const headers = { Authorization: 'Token ' + session.token };
   const [keysResponse, listResponse] = await Promise.all([
     fetch(API_BASE + '/keys/', { headers }),
@@ -177,7 +195,12 @@ async function decryptForNotification(messageId) {
     recipientDeviceId: session.deviceId,
   });
 
-  const profile = (await self.ReefDB.get('profiles', sender.id)) || {};
+  // Profiles are per-room, and the worker has never pointed the store at one —
+  // so this read went to the shared database, which does not hold them, and
+  // every notification was from "Someone".
+  self.ReefDB.useRoom(roomId);
+  const profile =
+    (await self.ReefDB.get(self.ReefDB.STORES.profiles, sender.id)) || {};
   return {
     handle: profile.handle || 'Someone',
     emoji: profile.emoji || '🐟',

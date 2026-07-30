@@ -40,9 +40,13 @@
       throw wrapped;
     }
 
-    if (response.status === 401) {
+    if (response.status === 401 && !options.noSignOut) {
       // The device was revoked, or the token is gone. Distinct from 403,
       // which only means "not yet approved".
+      //
+      // noSignOut exempts the two endpoints where a 401 means "you typed the
+      // wrong PIN" rather than "this device is finished". Without it, one typo
+      // wiped the keys and the whole local history.
       onUnauthorized();
       const err = new Error('unauthorized');
       err.status = 401;
@@ -73,9 +77,11 @@
       onUnauthorized = fn;
     },
 
-    unlock: (body) => request('/unlock/', { method: 'POST', json: body }),
+    unlock: (body) =>
+      request('/unlock/', { method: 'POST', json: body, noSignOut: true }),
     session: () => request('/session/'),
-    changePin: (body) => request('/pin/', { method: 'POST', json: body }),
+    changePin: (body) =>
+      request('/pin/', { method: 'POST', json: body, noSignOut: true }),
     devices: () => request('/devices/'),
     approveDevice: (id) => request(`/devices/${id}/approve/`, { method: 'POST' }),
     revokeDevice: (id) => request(`/devices/${id}/revoke/`, { method: 'POST' }),

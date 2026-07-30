@@ -44,15 +44,20 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .mark{display:flex;flex-direction:column;align-items:center;gap:18px;}
 .mark svg{width:64px;height:64px;opacity:.9;}
 .dots{display:flex;gap:13px;margin-top:6px;min-height:14px;}
-.dot{width:14px;height:14px;border-radius:50%;border:1.5px solid var(--line);transition:transform .12s,background .12s;}
+/* Short on purpose. This is the only confirmation that a digit landed, so a
+   long fade reads as lag. */
+.dot{width:14px;height:14px;border-radius:50%;border:1.5px solid var(--line);transition:transform .06s,background .06s;}
 .dot.full{background:var(--accent);border-color:var(--accent);transform:scale(1.12);}
 .dots.wrong{animation:shake .4s;}
 @keyframes shake{10%,90%{transform:translateX(-5px)}30%,70%{transform:translateX(6px)}50%{transform:translateX(-3px)}}
 #lock-note{color:var(--muted);font-size:14px;min-height:20px;text-align:center;}
 .keypad{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;width:100%;max-width:320px;}
 .key{height:72px;border-radius:20px;background:var(--surface);font-size:26px;font-weight:500;
-     display:flex;align-items:center;justify-content:center;transition:background .1s,transform .1s;}
-.key:active{background:var(--surface-2);transform:scale(.96);}
+     display:flex;align-items:center;justify-content:center;transition:background .06s,transform .06s;}
+/* .down is set from pointerdown in app.js. :active alone is not enough — iOS
+   Safari never applies it to a button, so on an iPhone the pad had no press
+   state at all. */
+.key:active,.key.down{background:var(--surface-2);transform:scale(.96);}
 .key.blank{background:none;}
 .key.util{font-size:20px;color:var(--muted);}
 
@@ -74,6 +79,15 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .who b{display:block;font-size:16px;font-weight:600;line-height:1.2;}
 .who span{display:block;font-size:12.5px;color:var(--muted);line-height:1.3;}
 .who span.live{color:var(--accent);}
+
+/* A device waiting to be let in used to announce itself with a 2.6s toast and
+   nothing else. This stays until it is dealt with. */
+.banner{display:none;align-items:center;gap:10px;width:100%;text-align:left;flex:0 0 auto;
+        padding:11px 12px;background:#3a1f1c;border-bottom:1px solid var(--danger);
+        color:var(--text);font-size:13.5px;z-index:2;}
+.banner.on{display:flex;}
+.banner .grow{flex:1;}
+.banner .go{color:var(--accent);font-weight:600;}
 
 #scroller{
   flex:1;overflow-y:auto;overflow-x:hidden;
@@ -172,6 +186,11 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .act .ico{width:22px;text-align:center;font-size:17px;}
 .act.bad{color:var(--danger);}
 .sheet-title{padding:2px 12px 10px;color:var(--muted);font-size:13px;}
+.act .stack{flex:1;min-width:0;}
+.act .stack b{display:block;font-weight:600;}
+/* Two people on two iPhones produce two rows both reading "iPhone". The
+   second line is what tells them apart. */
+.act .stack .sub{display:block;font-size:12px;color:var(--muted);margin-top:1px;}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;line-height:1.9;
       letter-spacing:.04em;background:var(--bg);padding:12px;border-radius:12px;word-spacing:6px;}
 
@@ -235,6 +254,12 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
       <button class="tap" id="menu" aria-label="More">⋯</button>
     </header>
 
+    <button class="banner" id="device-banner">
+      <span>⏳</span>
+      <span class="grow" id="device-banner-text"></span>
+      <span class="go">Review</span>
+    </button>
+
     <div id="scroller"><div id="list"></div></div>
 
     <div id="composer">
@@ -249,7 +274,7 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         <span>🐚</span>
         <span class="grow">The other side has no approved device yet — nothing can be sent.</span>
       </div>
-      <div id="edit-strip"
+      <div id="edit-strip">
         <span class="grow" id="edit-note"></span>
         <button class="tap" id="edit-cancel" aria-label="Cancel edit">✕</button>
       </div>

@@ -63,6 +63,9 @@
     lastSeen: null,
     stickBottom: true,
     unseen: 0,
+    devices: [],
+    pendingDevices: [],
+    build: null,
     hiddenAt: null,
     locked: true,
     // One PIN opens every room its holder is seated in, so the client keeps a
@@ -83,8 +86,10 @@
     const sync = () => {
       const kb = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
       document.documentElement.style.setProperty('--kb', kb + 'px');
-      // The list must stay where the eye left it across an open/close.
-      if (state.stickBottom) scrollToBottom(false);
+      // The list must stay where the eye left it across an open/close. Not
+      // scrollToBottom: that also clears the unread count, so opening the
+      // keyboard used to throw away "3 new ripples" without showing them.
+      if (state.stickBottom) pinToBottom();
     };
     vv.addEventListener('resize', sync);
     vv.addEventListener('scroll', sync);
@@ -132,7 +137,30 @@
       if (k === '') return pad.appendChild(el('div', 'key blank'));
       const button = el('button', 'key' + (k === '⌫' ? ' util' : ''), k);
       button.type = 'button';
-      button.addEventListener('click', () => onKey(k));
+
+      // pointerdown, not click. `click` fires when the finger lifts, and iOS
+      // Safari never applies :active to a button, so a click-driven pad shows
+      // nothing at all while it is being pressed — which is what made entering
+      // a PIN feel slow. The press state is a class for the same reason.
+      button.addEventListener('pointerdown', () => {
+        button._fromPointer = true;
+        button.classList.add('down');
+        onKey(k);
+      });
+      const up = () => button.classList.remove('down');
+      ['pointerup', 'pointercancel', 'pointerleave'].forEach((type) =>
+        button.addEventListener(type, up)
+      );
+      // Still bound, so Enter and Space on a focused key work. The flag stops
+      // a tap counting twice, since pointerdown always precedes the click.
+      button.addEventListener('click', () => {
+        if (button._fromPointer) {
+          button._fromPointer = false;
+          return;
+        }
+        onKey(k);
+      });
+
       pad.appendChild(button);
     });
   }
@@ -154,24 +182,38 @@
 
   async function submitPin(pin) {
     lockBusy = true;
-    $('lock-note').textContent = '';
+    // The pad is frozen for the length of a round trip, and the server hashes
+    // the PIN deliberately slowly. Without this the sixth digit looks like a
+    // hang.
+    $('lock-note').textContent = 'Checking…';
     try {
       await unlockWith(pin);
+      $('lock-note').textContent = '';
     } catch (err) {
       entry = '';
       paintDots(true);
       buzz([40, 60, 40]);
-      if (err && err.status === 429) {
-        const wait = Number(err.retryAfter || 0);
-        $('lock-note').textContent = wait
-          ? `Try again in ${Math.ceil(wait / 60)} min`
-          : 'Try again later';
-      } else if (err && err.offline) {
-        $('lock-note').textContent = 'No connection';
-      }
+      $('lock-note').textContent = lockError(err);
     } finally {
       lockBusy = false;
     }
+  }
+
+  /* Every failure used to shake the dots and say nothing, so a server error and
+   * a wrong PIN were indistinguishable — and so was signing in correctly with
+   * nobody to talk to yet. */
+  function lockError(err) {
+    if (!err) return 'That did not work';
+    if (err.offline) return 'No connection';
+    if (err.noRooms) return 'Signed in, but you are not in a conversation yet';
+    if (err.status === 429) {
+      const wait = Number(err.retryAfter || 0);
+      return wait ? `Try again in ${Math.ceil(wait / 60)} min` : 'Try again later';
+    }
+    if (err.status === 400 || err.status === 401 || err.status === 403) {
+      return 'Wrong PIN';
+    }
+    return 'Something went wrong — try again';
   }
 
   /* ==================================================================== *
@@ -221,6 +263,15 @@
       throw err;
     }
 
+    // Checked before anything is stored. An empty list used to fall through to
+    // `preferred.room_id` on undefined, and the resulting TypeError was caught
+    // by submitPin — so a correct PIN reported itself as wrong.
+    if (!result.rooms || !result.rooms.length) {
+      const err = new Error('no rooms');
+      err.noRooms = true;
+      throw err;
+    }
+
     // One PIN, every room that person is seated in. Each comes with its own
     // device and token, because a device is approved room by room.
     const sessions = {};
@@ -250,12 +301,16 @@
   async function enterRoom(roomId, prefetched) {
     if (state.stream) state.stream.close();
     state.stream = null;
+    clearInterval(devicesTimer);
     state.messages = new Map();
     state.profiles = {};
     state.recipients = [];
     state.pairKeys = {};
     state.window = 60;
     state.unseen = 0;
+    state.devices = [];
+    state.pendingDevices = [];
+    paintDeviceBanner();
     clearReply();
     cancelEdit();
 
@@ -290,6 +345,12 @@
     }
     showScreen('pool');
     refreshRequests();
+    // A device waiting for approval only ever announced itself through a live
+    // WebSocket event. Anyone who was not looking at the screen at that moment
+    // — app closed, backgrounded, reconnecting — never learned about it. Asking
+    // on the way in means a request that arrived overnight is still visible.
+    refreshDevices();
+    watchDevices();
     await loadProfileSettings();
     await hydrateFromLocal();
     await refreshKeys();
@@ -324,6 +385,7 @@
 
   async function signOut() {
     clearInterval(approvalTimer);
+    clearInterval(devicesTimer);
     if (state.stream) state.stream.close();
     await DB.wipeEverything();
     location.reload();
@@ -410,7 +472,10 @@
         receipts: row.receipts || [],
         state: 'sent',
       });
-      if (row.envelope && !merged.body) {
+      // The placeholder body is truthy, so `!merged.body` alone meant a message
+      // that failed to open once was never tried again — not even after
+      // refreshKeys produced the pair key it was waiting for.
+      if (row.envelope && (!merged.body || merged.body.undecryptable)) {
         merged.body = await tryOpen(row);
       }
       if (merged.deleted) merged.body = null;
@@ -546,6 +611,9 @@
     const row = el('div', 'row' + (message.mine ? ' mine' : '') +
       (shape.tail ? ' tail' : '') + (shape.grouped ? '' : ' gap'));
     row.dataset.id = message.id;
+    // Kept so refreshRow can rebuild this one row without recomputing how it
+    // groups against its neighbours.
+    row._shape = shape;
 
     const bubble = el('div', 'bubble');
     const body = message.body || {};
@@ -597,6 +665,28 @@
     attachGestures(row, bubble, message);
     row.appendChild(bubble);
     return row;
+  }
+
+  /* One row, in place.
+   *
+   * A tick or a reaction changes one bubble, but the only tool for it was
+   * renderList — which empties #list and rebuilds every visible row, each with
+   * fresh gesture listeners and observers. Two people reading each other's
+   * messages generate a stream of these, and the whole thread was thrown away
+   * and rebuilt on each one. Grouping cannot change here, so the stored shape
+   * is reused; anything that moves a message still goes through renderList. */
+  function refreshRow(message) {
+    const rows = $('list').children;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].dataset && rows[i].dataset.id === message.id) {
+        rows[i].replaceWith(
+          renderRow(message, rows[i]._shape || { grouped: false, tail: true })
+        );
+        return;
+      }
+    }
+    // Not on screen — outside the window, or the day divider moved. Fall back.
+    renderList();
   }
 
   function renderTick(message) {
@@ -696,9 +786,17 @@
     node.classList.remove('pending');
   }
 
-  function scrollToBottom(smooth) {
+  /* Movement only. Nothing here counts as "the reader has caught up". */
+  function pinToBottom(smooth) {
     const scroller = $('scroller');
-    scroller.scrollTo({ top: scroller.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    scroller.scrollTo({
+      top: scroller.scrollHeight,
+      behavior: smooth ? 'smooth' : 'auto',
+    });
+  }
+
+  function scrollToBottom(smooth) {
+    pinToBottom(smooth);
     state.unseen = 0;
     paintPill();
   }
@@ -795,11 +893,21 @@
   function onTyping() {
     autogrow();
     saveDraft();
+    if (!state.stream) return;
+    // Clearing the box says so. Only `true` was ever sent, so the other side
+    // sat on "blowing bubbles…" until its own four-second timeout expired.
+    if (!$('text').value.trim()) return stopTyping();
     const now = Date.now();
-    if (state.stream && now - typingSent > 2000) {
+    if (now - typingSent > 2000) {
       typingSent = now;
       state.stream.send({ type: 'typing', is_typing: true });
     }
+  }
+
+  function stopTyping() {
+    if (!typingSent) return;
+    typingSent = 0;
+    if (state.stream) state.stream.send({ type: 'typing', is_typing: false });
   }
 
   let draftTimer;
@@ -841,6 +949,7 @@
     pendingFiles = [];
     box.value = '';
     autogrow();
+    stopTyping();
     DB.del(DB.STORES.settings, 'draft');
     const replyTo = state.replyTo;
     clearReply();
@@ -873,7 +982,10 @@
   }
 
   async function queueOutbox(job) {
-    await DB.put(DB.STORES.outbox, job);
+    // flushOutbox sorts on this. It was never written, so a batch composed
+    // offline went out in whatever order IndexedDB happened to return the
+    // uuid keys in.
+    await DB.put(DB.STORES.outbox, Object.assign({ queuedAt: Date.now() }, job));
   }
 
   let flushing = false;
@@ -898,7 +1010,7 @@
           if (message) {
             message.state = 'failed';
             await DB.putMessages([message]);
-            renderList();
+            refreshRow(message);
           }
         }
       }
@@ -914,7 +1026,7 @@
     job.blocked = false;
     await DB.put(DB.STORES.outbox, job);
     message.state = 'pending';
-    renderList();
+    refreshRow(message);
     flushOutbox();
   }
 
@@ -1117,7 +1229,14 @@
    * Sheets
    * ==================================================================== */
 
-  function openSheet(build) {
+  // A locked sheet cannot be dismissed by tapping the scrim. It has to be a
+  // flag the scrim handler reads: the previous attempt cleared $('scrim').onclick,
+  // which does nothing to a listener added with addEventListener, so the one
+  // sheet with no way out had one after all.
+  let sheetLocked = false;
+
+  function openSheet(build, options) {
+    sheetLocked = !!(options && options.locked);
     const sheet = $('sheet');
     sheet.innerHTML = '';
     sheet.appendChild(el('div', 'grab'));
@@ -1127,6 +1246,7 @@
   }
 
   function closeSheet() {
+    sheetLocked = false;
     $('sheet').classList.remove('on');
     $('scrim').classList.remove('on');
   }
@@ -1209,6 +1329,12 @@
       action('🔢', 'Change PIN', () => openPinSheet());
       action('↻', 'Force refresh', forceRefresh);
       action('🔒', 'Lock now', lockNow);
+      if (state.build) {
+        // Answers "did my fix actually deploy?" without guessing.
+        const stamp = el('div', 'sheet-title', 'Build ' + state.build);
+        stamp.style.cssText += ';text-align:center;padding-top:8px';
+        sheet.appendChild(stamp);
+      }
     });
   }
 
@@ -1220,7 +1346,51 @@
     } catch (e) {
       state.requests = [];
     }
-    $('menu').textContent = state.requests.length ? '⋯•' : '⋯';
+    paintBadge();
+  }
+
+  /* Both kinds of "someone is waiting on you" share the one dot, so they share
+   * the one function that draws it. Setting it from two places meant whichever
+   * refresh finished last erased the other. */
+  function paintBadge() {
+    const waiting = state.requests.length + state.pendingDevices.length;
+    $('menu').textContent = waiting ? '⋯•' : '⋯';
+  }
+
+  async function refreshDevices() {
+    try {
+      state.devices = (await API.devices()).devices || [];
+    } catch (e) {
+      return; // offline; whatever was last known stays on screen
+    }
+    // Only the other person's pending devices are actionable here — this side
+    // cannot let its own second phone in, by design.
+    state.pendingDevices = state.devices.filter(
+      (d) => d.status === 'pending' && !d.is_self && d.slot !== state.session.slot
+    );
+    paintBadge();
+    paintDeviceBanner();
+  }
+
+  let devicesTimer = null;
+
+  /* Slow, and only a safety net. device.pending over the WebSocket is the fast
+   * path; this exists so a missed event — a reconnect, a server that never
+   * sends one — cannot leave an approval request invisible for a whole session.
+   * The device doing the waiting already polls every four seconds. */
+  function watchDevices() {
+    clearInterval(devicesTimer);
+    devicesTimer = setInterval(refreshDevices, 60000);
+  }
+
+  function paintDeviceBanner() {
+    const count = state.pendingDevices.length;
+    $('device-banner').classList.toggle('on', count > 0);
+    if (!count) return;
+    $('device-banner-text').textContent =
+      count === 1
+        ? 'A new device is waiting for you to let it in'
+        : `${count} new devices are waiting for you to let them in`;
   }
 
   async function openCodeSheet() {
@@ -1467,17 +1637,36 @@
     });
   }
 
+  const DEVICE_STATUS = {
+    active: 'signed in',
+    pending: 'waiting to be let in',
+    revoked: 'signed out',
+  };
+
   async function openDevicesSheet() {
-    let result;
+    let devices;
     try {
-      result = await API.devices();
+      devices = (await API.devices()).devices || [];
     } catch (e) {
       return toast('Offline');
     }
+    state.devices = devices;
+    state.pendingDevices = devices.filter(
+      (d) => d.status === 'pending' && !d.is_self && d.slot !== state.session.slot
+    );
+    paintBadge();
+    paintDeviceBanner();
+
+    const mine = devices.filter((d) => d.slot === state.session.slot);
+    const theirs = devices.filter((d) => d.slot !== state.session.slot);
+    const peerHandle = peerProfile().handle;
+    const theirTitle =
+      peerHandle && peerHandle !== 'Reef'
+        ? `${peerHandle}’s devices`
+        : 'The other person’s devices';
+
     openSheet((sheet) => {
       sheet.appendChild(el('div', 'sheet-title', 'Everything signed in right now.'));
-      const mine = result.devices.filter((d) => d.slot === state.session.slot);
-      const theirs = result.devices.filter((d) => d.slot !== state.session.slot);
 
       const act = (label, color, fn) => {
         const button = el('button', null, label);
@@ -1486,49 +1675,87 @@
         return button;
       };
 
+      /* Every one of these used to be an un-caught await. A rejected approval
+       * left the sheet open with no toast and no error, which looks exactly
+       * like a button that does nothing. */
+      const guard = (fn, done) => async () => {
+        try {
+          await fn();
+          closeSheet();
+          toast(done);
+          await refreshDevices();
+          await refreshKeys();
+        } catch (err) {
+          toast(err && err.offline ? 'Offline — try again' : 'Could not do that');
+        }
+      };
+
+      // The id is the only field certain to differ between two phones with the
+      // same name. The timestamps are shown when the server sends them.
+      const subtitle = (device) => {
+        const bits = [device.is_self ? 'this device' : null];
+        bits.push(DEVICE_STATUS[device.status] || device.status);
+        bits.push('#' + device.id);
+        if (device.created_at) bits.push('added ' + dayLabel(device.created_at));
+        if (device.last_seen_at) bits.push('last seen ' + dayLabel(device.last_seen_at));
+        return bits.filter(Boolean).join(' · ');
+      };
+
       const render = (device) => {
         const row = el('div', 'act');
         row.appendChild(el('span', 'ico', device.status === 'pending' ? '⏳' : '📱'));
-        const label = el(
-          'span',
-          null,
-          `${device.label || 'Device'} · ${device.is_self ? 'this one' : device.status}`
-        );
-        label.style.flex = '1';
-        row.appendChild(label);
 
-        if (device.status === 'pending' && !device.is_self) {
+        const stack = el('div', 'stack');
+        stack.appendChild(el('b', null, device.label || 'Device'));
+        stack.appendChild(el('span', 'sub', subtitle(device)));
+        row.appendChild(stack);
+
+        const theirPending =
+          device.status === 'pending' && !device.is_self && device.slot !== state.session.slot;
+
+        if (theirPending) {
           row.appendChild(
-            act('Approve', 'var(--accent)', async () => {
-              await API.approveDevice(device.id);
-              closeSheet();
-              await refreshKeys();
-              toast('Approved. Compare the safety number.');
-            })
+            act(
+              'Approve',
+              'var(--accent)',
+              guard(
+                () => API.approveDevice(device.id),
+                'Approved. Compare the safety number.'
+              )
+            )
           );
           // Turning one down was only ever possible from the API. Without it,
           // an unexpected request just sat in the list, and a list of requests
           // you cannot clear is how people end up approving one to be rid of it.
           row.appendChild(
-            act('Reject', 'var(--danger)', async () => {
-              await API.revokeDevice(device.id);
-              closeSheet();
-              toast('Turned down.');
-            })
+            act(
+              'Reject',
+              'var(--danger)',
+              guard(() => API.revokeDevice(device.id), 'Turned down.')
+            )
           );
         } else if (!device.is_self && device.slot === state.session.slot) {
+          // Approve is deliberately absent here: a device is let in by the
+          // *other* person, so offering it on your own slot only produced a
+          // button that failed at the server.
           row.appendChild(
-            act('Sign out', 'var(--danger)', async () => {
-              await API.revokeDevice(device.id);
-              closeSheet();
-              toast('Signed that one out.');
-            })
+            act(
+              'Sign out',
+              'var(--danger)',
+              guard(() => API.revokeDevice(device.id), 'Signed that one out.')
+            )
           );
         }
         sheet.appendChild(row);
       };
 
-      if (theirs.some((d) => d.status === 'pending')) {
+      const heading = (text) => {
+        const node = el('div', 'sheet-title', text);
+        node.style.cssText += ';margin-top:8px;color:var(--text);font-weight:600';
+        sheet.appendChild(node);
+      };
+
+      if (state.pendingDevices.length) {
         const warn = el(
           'div',
           'sheet-title',
@@ -1540,8 +1767,17 @@
         sheet.appendChild(warn);
       }
 
-      theirs.forEach(render);
-      mine.forEach(render);
+      // Ownership was previously conveyed by list order alone — theirs first,
+      // yours second, under one heading. Nothing on screen said which was
+      // which, which is the one thing this list exists to make clear.
+      if (theirs.length) {
+        heading(theirTitle);
+        theirs.forEach(render);
+      }
+      if (mine.length) {
+        heading('Your devices');
+        mine.forEach(render);
+      }
     });
   }
 
@@ -1593,11 +1829,7 @@
         }
       });
       sheet.appendChild(save);
-      if (forced) {
-        // No way past this sheet except through it.
-        $('scrim').onclick = null;
-      }
-    });
+    }, { locked: forced });
   }
 
   /* ==================================================================== *
@@ -1662,7 +1894,7 @@
       message.body = body;
       message.editedAt = result.edited_at;
       await DB.putMessages([message]);
-      renderList();
+      refreshRow(message);
     } catch (err) {
       toast(err.status === 409 ? 'Edit window closed' : 'Could not edit');
     }
@@ -1674,7 +1906,7 @@
       message.deleted = true;
       message.body = null;
       await DB.putMessages([message]);
-      renderList();
+      refreshRow(message);
     } catch (e) {
       toast('Could not delete');
     }
@@ -1707,7 +1939,7 @@
       (r) => r.device_id !== state.device.id
     );
     message.reactions.push({ device_id: state.device.id, emoji });
-    renderList();
+    refreshRow(message);
     try {
       await API.react(message.id, payload);
     } catch (e) {
@@ -1795,7 +2027,7 @@
             envelope: event.envelope,
           });
           await DB.putMessages([message]);
-          renderList();
+          refreshRow(message);
         }
         break;
       }
@@ -1806,7 +2038,7 @@
           message.deleted = true;
           message.body = null;
           await DB.putMessages([message]);
-          renderList();
+          refreshRow(message);
         }
         break;
       }
@@ -1833,7 +2065,7 @@
           }
         }
         await DB.putMessages([message]);
-        renderList();
+        refreshRow(message);
         break;
       }
 
@@ -1849,7 +2081,7 @@
             read_at: event.read_at,
           });
           await DB.putMessages([message]);
-          renderList();
+          refreshRow(message);
         }
         break;
       }
@@ -1872,12 +2104,17 @@
         paintHeader();
         break;
 
+      // The toast is the nudge, not the record. refreshDevices puts a dot on
+      // the menu and a banner over the thread, both of which survive the 2.6
+      // seconds the toast lasts.
       case 'device.pending':
+        await refreshDevices();
         toast('A new device wants in — check Devices');
         break;
 
       case 'device.approved':
       case 'device.revoked':
+        await refreshDevices();
         await refreshKeys();
         break;
     }
@@ -1947,6 +2184,7 @@
 
   function lockNow() {
     state.locked = true;
+    clearInterval(devicesTimer);
     entry = '';
     paintDots();
     $('lock-note').textContent = '';
@@ -2012,6 +2250,7 @@
 
   function wire() {
     $('text').addEventListener('input', onTyping);
+    $('text').addEventListener('blur', stopTyping);
     $('text').addEventListener('focus', () => {
       $('emoji').classList.remove('on');
       setTimeout(() => state.stickBottom && scrollToBottom(false), 250);
@@ -2032,7 +2271,10 @@
     $('reply-cancel').addEventListener('click', clearReply);
     $('edit-cancel').addEventListener('click', cancelEdit);
     $('menu').addEventListener('click', openMenuSheet);
-    $('scrim').addEventListener('click', closeSheet);
+    $('device-banner').addEventListener('click', openDevicesSheet);
+    $('scrim').addEventListener('click', () => {
+      if (!sheetLocked) closeSheet();
+    });
     $('viewer-close').addEventListener('click', () => $('viewer').classList.remove('on'));
     $('viewer').addEventListener('click', (event) => {
       if (event.target.id === 'viewer') $('viewer').classList.remove('on');
@@ -2047,6 +2289,20 @@
       lockNow();
     });
     $('pending-signout').addEventListener('click', signOut);
+
+    // The pad was tappable and nothing else, so on a laptop typing the PIN on
+    // the number row did nothing at all.
+    document.addEventListener('keydown', (event) => {
+      if (!$('lock').classList.contains('on')) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (/^[0-9]$/.test(event.key)) {
+        event.preventDefault();
+        onKey(event.key);
+      } else if (event.key === 'Backspace') {
+        event.preventDefault();
+        onKey('⌫');
+      }
+    });
 
     const scroller = $('scroller');
     scroller.addEventListener(
@@ -2098,6 +2354,21 @@
 
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch(() => {});
+      // Neither of the worker's two messages had anyone listening. Background
+      // sync posted flush-outbox into the void, and the build stamp it answers
+      // with was never asked for — so "which build am I running?" had no answer
+      // on the one screen that could show it.
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        const data = event.data;
+        if (data && data.type === 'flush-outbox') flushOutbox();
+        else if (data && data.type === 'build') state.build = data.build;
+      });
+      navigator.serviceWorker.ready
+        .then((registration) => {
+          const worker = registration.active || navigator.serviceWorker.controller;
+          if (worker) worker.postMessage('build');
+        })
+        .catch(() => {});
     }
 
     API.onUnauthorized(() => {
