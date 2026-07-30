@@ -242,6 +242,9 @@
     setIdentity: (value) => putShared(value, 'identity'),
     sessions: () => getShared('sessions').then((v) => v || {}),
     setSessions: (value) => putShared(value, 'sessions'),
+    /* Drops the tokens and nothing else. What a revoked device needs: it can no
+     * longer fetch, but the messages it already holds are still its own. */
+    forgetSessions: () => putShared({}, 'sessions'),
     profile: () => getShared('me'),
     setProfile: (value) => putShared(value, 'me'),
     // Shared rather than per-room, and deliberately: it is a property of this

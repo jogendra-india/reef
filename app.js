@@ -414,7 +414,9 @@
           await afterUnlock();
         } else if (result.device.status === 'revoked') {
           clearInterval(approvalTimer);
-          await signOut();
+          // Turned down. This device may have been active before and still hold
+          // messages, and being refused entry is no reason to destroy them.
+          await signOut({ keepHistory: true });
         }
       } catch (e) {
         /* offline; keep waiting */
@@ -422,12 +424,29 @@
     }, 4000);
   }
 
-  async function signOut() {
+  /* Two different things, previously conflated.
+   *
+   * "Start over on this device" means erase it, and does. Being signed out
+   * *remotely* — which is what happens to the old device when a replacement is
+   * approved — used to run the same wipe, so a device you had not touched lost
+   * every message it held. That was never a security gain: messages are stored
+   * decrypted because the device is the trust boundary, so anybody holding the
+   * device could already read them. All revocation should take is the ability to
+   * fetch more.
+   *
+   * So the credentials go and the history stays. Sign in again on that device —
+   * after the other person approves it, since the room now has messages — and the
+   * thread is where you left it. */
+  async function signOut({ keepHistory = false } = {}) {
     clearInterval(approvalTimer);
     clearInterval(devicesTimer);
     clearInterval(presenceTimer);
     if (state.stream) state.stream.close();
-    await DB.wipeEverything();
+    if (keepHistory) {
+      await DB.forgetSessions();
+    } else {
+      await DB.wipeEverything();
+    }
     location.reload();
   }
 
@@ -496,7 +515,20 @@
   async function ingest(rows, prepend) {
     const decoded = [];
     for (const row of rows) {
-      const existing = state.messages.get(row.id);
+      let existing = state.messages.get(row.id);
+      if (!existing) {
+        // Not in memory is not the same as not on this device. hydrateFromLocal
+        // loads the most recent 400, so scrolling further back re-fetches rows
+        // whose plaintext is already stored here — and the placeholder below
+        // would then overwrite a perfectly good local copy, permanently, via
+        // putMessages. Your own messages are the worst case: the server holds no
+        // envelope addressed to you, so the local copy is the only one there is.
+        try {
+          existing = await DB.get(DB.STORES.messages, row.id);
+        } catch (e) {
+          /* no local copy */
+        }
+      }
       const merged = Object.assign({}, existing || {}, {
         id: row.id,
         seq: row.seq,
@@ -2341,7 +2373,21 @@
         theirs.forEach(render);
       }
       if (mine.length) {
+        const active = mine.filter((d) => d.status === 'active').length;
         heading('Your devices');
+        // Several at once is allowed, so say how many are in use and what
+        // happens at the limit — otherwise signing in somewhere new looks like
+        // it might silently evict something.
+        const note = el(
+          'div',
+          'sheet-title',
+          active >= 3
+            ? `${active} signed in, which is the limit — the one you have not ` +
+              'opened for longest makes way for the next.'
+            : `${active} signed in. Up to 3 at once; sign one out here when you ` +
+              'are done with it.'
+        );
+        sheet.appendChild(note);
         mine.forEach(render);
       }
     });
@@ -3005,13 +3051,13 @@
       try {
         sessionStorage.setItem(
           'reef-signed-out',
-          'This device was signed out, most likely because a newer one was ' +
-            'approved. Enter your PIN to use it again.'
+          'This device was signed out. Your messages are still here — enter ' +
+            'your PIN to use it again.'
         );
       } catch (e) {
         /* private mode: the reload will just be silent */
       }
-      signOut();
+      signOut({ keepHistory: true });
     });
 
     const sessions = await DB.sessions();
