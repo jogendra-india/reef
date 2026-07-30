@@ -154,6 +154,23 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .file b{display:block;font-weight:600;font-size:14px;
         white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .file span{display:block;font-size:12px;opacity:.75;}
+
+/* Staged attachments — what is about to go, and a way to change your mind. */
+#staged{display:none;gap:6px;margin:2px 4px 6px;padding-bottom:2px;
+        overflow-x:auto;overscroll-behavior-x:contain;}
+#staged.on{display:flex;}
+.stage{position:relative;flex:0 0 auto;display:flex;align-items:center;gap:8px;
+       max-width:210px;padding:6px 8px;border-radius:12px;
+       background:var(--surface);border:1px solid var(--line);font-size:12.5px;}
+.stage img{width:34px;height:34px;border-radius:8px;object-fit:cover;flex:0 0 auto;}
+.stage .ico{font-size:20px;flex:0 0 auto;}
+.stage .grow{min-width:0;}
+.stage b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;
+         text-overflow:ellipsis;max-width:110px;}
+.stage span{display:block;color:var(--muted);font-size:11.5px;}
+.stage .drop{width:26px;height:26px;border-radius:50%;flex:0 0 auto;
+             background:var(--surface-2);color:var(--muted);font-size:13px;
+             display:flex;align-items:center;justify-content:center;}
 .reacts{display:flex;gap:3px;margin-top:4px;}
 .reacts{cursor:pointer;}
 .react{background:var(--surface);border:1px solid var(--line);border-radius:11px;
@@ -324,6 +341,10 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         <span class="grow" id="edit-note"></span>
         <button class="tap" id="edit-cancel" aria-label="Cancel edit">✕</button>
       </div>
+      <!-- What is attached but not yet sent. Previously invisible: a toast, then
+           nothing until it went. -->
+      <div id="staged"></div>
+
       <div class="inputrow">
         <button class="tap" id="attach" aria-label="Attach">＋</button>
         <textarea id="text" rows="1" placeholder="Say something…"

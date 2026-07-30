@@ -346,6 +346,8 @@
     state.peerLive = [];
     state.peerOnline = false;
     state.lastSeen = null;
+    // Attachments belong to the conversation they were picked for.
+    clearStaged();
     paintDeviceBanner();
     clearReply();
     cancelEdit();
@@ -1258,7 +1260,7 @@
     const id = uuid();
     const body = { v: 1, type: pendingFiles.length ? 'media' : 'text', text };
     const files = pendingFiles;
-    pendingFiles = [];
+    clearStaged();
     box.value = '';
     autogrow();
     stopTyping();
@@ -1420,6 +1422,67 @@
     return `${n < 10 && unit > 0 ? n.toFixed(1) : Math.round(n)} ${units[unit]}`;
   };
 
+  /* What is attached but not yet sent.
+   *
+   * Attaching used to produce a toast and then nothing, so there was no way to
+   * tell whether a file had actually been picked, which one, or how to change
+   * your mind short of sending and deleting.
+   *
+   * The thumbnail is the one already made for the upload, so previewing costs
+   * nothing extra. Object URLs are cached on the staged entry and revoked when it
+   * goes, since a picture picked and dropped ten times should not leak ten of
+   * them. */
+  function paintStaged() {
+    const strip = $('staged');
+    strip.innerHTML = '';
+    strip.classList.toggle('on', pendingFiles.length > 0);
+
+    pendingFiles.forEach((file, index) => {
+      const chip = el('div', 'stage');
+
+      const isImage = String(file.mime || '').startsWith('image/');
+      if (isImage) {
+        if (!file.previewUrl) {
+          const bytes = file.thumbBytes || file.bytes;
+          file.previewUrl = URL.createObjectURL(new Blob([bytes], { type: file.mime }));
+        }
+        const shot = el('img');
+        shot.src = file.previewUrl;
+        shot.alt = '';
+        chip.appendChild(shot);
+      } else {
+        chip.appendChild(el('span', 'ico', fileIcon(file.mime)));
+      }
+
+      const stack = el('div', 'grow');
+      stack.appendChild(el('b', null, file.name || 'file'));
+      stack.appendChild(el('span', null, fileSize(file.size || file.bytes.length)));
+      chip.appendChild(stack);
+
+      const drop = el('button', 'drop', '✕');
+      drop.type = 'button';
+      drop.setAttribute('aria-label', `Remove ${file.name || 'attachment'}`);
+      drop.addEventListener('click', () => {
+        const [removed] = pendingFiles.splice(index, 1);
+        if (removed && removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+        paintStaged();
+        autogrow();
+      });
+      chip.appendChild(drop);
+
+      strip.appendChild(chip);
+    });
+  }
+
+  /* Called once the files have gone, or been abandoned. */
+  function clearStaged() {
+    pendingFiles.forEach((file) => {
+      if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+    });
+    pendingFiles = [];
+    paintStaged();
+  }
+
   async function onFiles(fileList) {
     for (const file of [...fileList]) {
       // Checked on the original: an image is re-encoded smaller below, so
@@ -1435,15 +1498,12 @@
           continue;
         }
         pendingFiles.push(prepared);
-        toast(
-          pendingFiles.length === 1
-            ? `${prepared.name} attached`
-            : `${pendingFiles.length} attached`
-        );
       } catch (e) {
         toast(`Could not read ${file.name || 'that file'}`);
       }
     }
+    // The strip says what is attached, so a toast counting them is redundant.
+    paintStaged();
     autogrow();
   }
 
