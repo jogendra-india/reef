@@ -395,6 +395,10 @@
     state.peerOnline = false;
     state.lastSeen = null;
     deliveredSent.clear();
+    // A result set belongs to the conversation it was found in, and the search
+    // store is room-scoped, so both go with the room.
+    closeSearch();
+    clearMatches();
     // Attachments belong to the conversation they were picked for.
     clearStaged();
     paintDeviceBanner();
@@ -3385,6 +3389,10 @@
     clearInterval(presenceTimer);
     if (state.stream) state.stream.close();
     state.stream = null;
+    // Both sit above the lock screen in the stacking order, so leaving either
+    // open would show the conversation through it.
+    closeSearch();
+    clearMatches();
     entry = '';
     paintDots();
     $('lock-note').textContent = '';
@@ -3445,6 +3453,228 @@
   }
 
   /* ==================================================================== *
+   * Search
+   * ==================================================================== *
+   *
+   * Entirely local, and not as a shortcut: the server holds ciphertext and no
+   * key, so there is no word of this it could index even if it wanted to. What
+   * this device has decrypted and stored is the whole of the corpus.
+   *
+   * It reads IndexedDB rather than `state.messages`, which is deliberate — the
+   * thread keeps only the most recent few hundred in memory, and a search that
+   * silently stopped at the edge of the scrollback would be worse than none:
+   * "no results" would be indistinguishable from "not loaded yet". */
+
+  // Every message on this device, read once when search opens. Held only for
+  // the life of the panel, so a long conversation is not pinned in memory.
+  let searchRows = null;
+  let searchTimer = null;
+  const SEARCH_LIMIT = 200;
+
+  // The last result set, kept alive *after* the panel closes. Without this,
+  // finding the seventeenth mention of something meant going back to the list
+  // and starting again for every one of them. Chronological, so ↑ is reliably
+  // "further back" and the counter reads the same way round as the thread.
+  let matches = [];
+  let matchAt = -1;
+  let matchQuery = '';
+  let searchHits = [];
+  let searchQuery = '';
+
+  /* What a message offers up to a search: what was said, plus the names of
+   * anything attached. A file you sent is often the only thing you remember
+   * about the message that carried it. */
+  function searchableText(message) {
+    if (message.deleted || isSystem(message)) return '';
+    const body = message.body || {};
+    if (body.undecryptable) return '';
+    const names = (body.files || []).map((f) => f.name || '').join(' ');
+    return `${body.text || ''} ${names}`.trim();
+  }
+
+  async function openSearch() {
+    const panel = $('search');
+    panel.classList.add('on');
+    $('search-input').value = '';
+    $('search-results').innerHTML = '';
+    $('search-note').textContent = 'Reading this device…';
+    try {
+      searchRows = (await DB.all(DB.STORES.messages)) || [];
+    } catch (e) {
+      // The store is scoped to the open room, so falling back to memory keeps
+      // search working rather than failing shut.
+      searchRows = [...state.messages.values()];
+    }
+    const count = searchRows.filter((m) => searchableText(m)).length;
+    $('search-note').textContent = `${count} message${count === 1 ? '' : 's'} on this device.`;
+    $('search-input').focus();
+  }
+
+  function closeSearch() {
+    $('search').classList.remove('on');
+    $('search-input').blur();
+    clearTimeout(searchTimer);
+    // Read before this runs by jumpTo, which is the only caller that needs it.
+    searchRows = null;
+    searchHits = [];
+    searchQuery = '';
+  }
+
+  function runSearch(raw) {
+    const query = raw.trim().toLowerCase();
+    const results = $('search-results');
+    results.innerHTML = '';
+    if (!query) {
+      const total = (searchRows || []).filter((m) => searchableText(m)).length;
+      $('search-note').textContent = `${total} message${total === 1 ? '' : 's'} on this device.`;
+      return;
+    }
+
+    const hits = [];
+    for (const message of searchRows || []) {
+      const text = searchableText(message);
+      if (text && text.toLowerCase().includes(query)) hits.push({ message, text });
+    }
+    // Held chronologically, because that is the order the thread will be walked
+    // in. The list below reverses a copy — newest first is right for reading
+    // results, and wrong for stepping through them.
+    hits.sort((a, b) => (a.message.seq || 0) - (b.message.seq || 0));
+    searchHits = hits;
+    searchQuery = query;
+
+    if (!hits.length) {
+      $('search-note').textContent = 'Nothing matches that.';
+      return;
+    }
+    const shown = [...hits].reverse().slice(0, SEARCH_LIMIT);
+    $('search-note').textContent =
+      hits.length > shown.length
+        ? `${hits.length} matches — newest ${shown.length} listed, all ${hits.length} walkable.`
+        : `${hits.length} match${hits.length === 1 ? '' : 'es'}.`;
+
+    shown.forEach(({ message, text }) => {
+      const row = el('button', 'hit');
+      row.type = 'button';
+      const who = el('div', 'hit-who');
+      who.appendChild(el('b', null, message.mine ? 'You' : whoIs(message.senderDeviceId)));
+      who.appendChild(el('span', null, stamp(message.createdAt)));
+      row.appendChild(who);
+      row.appendChild(snippet(text, query));
+      row.addEventListener('click', () => jumpTo(message.id));
+      results.appendChild(row);
+    });
+  }
+
+  /* The match in its context, with the query marked.
+   *
+   * Assembled from text nodes and <mark> elements rather than an innerHTML
+   * string. In an end-to-end encrypted messenger a message body is the most
+   * hostile input there is — it arrives from another device and nothing in
+   * between has looked at it — so it never becomes markup. */
+  function snippet(text, query) {
+    const at = text.toLowerCase().indexOf(query);
+    const from = Math.max(0, at - 40);
+    const clipped =
+      (from ? '…' : '') +
+      text.slice(from, from + 180) +
+      (from + 180 < text.length ? '…' : '');
+
+    const node = el('div', 'hit-text');
+    const lower = clipped.toLowerCase();
+    let index = 0;
+    for (;;) {
+      const found = lower.indexOf(query, index);
+      if (found < 0) break;
+      if (found > index) {
+        node.appendChild(document.createTextNode(clipped.slice(index, found)));
+      }
+      node.appendChild(el('mark', null, clipped.slice(found, found + query.length)));
+      index = found + query.length;
+    }
+    node.appendChild(document.createTextNode(clipped.slice(index)));
+    return node;
+  }
+
+  /* Opens the thread at a result, and keeps the rest of the set to hand.
+   *
+   * A hit is very often older than the window the thread is holding, so the
+   * rows read out of IndexedDB are merged in first — without overwriting
+   * anything already in memory, which may carry a state the stored copy does
+   * not. */
+  function jumpTo(id) {
+    (searchRows || []).forEach((m) => {
+      if (!state.messages.has(m.id)) state.messages.set(m.id, m);
+    });
+    matches = searchHits.map((h) => h.message.id);
+    matchQuery = searchQuery;
+    matchAt = Math.max(0, matches.indexOf(id));
+    closeSearch();
+    goToMatch();
+  }
+
+  /* Widens the window just far enough to reach one message, rather than
+   * rendering the entire history to get at something from March. */
+  function revealMessage(id) {
+    const rows = ordered();
+    const index = rows.findIndex((m) => m.id === id);
+    if (index < 0) return null;
+    state.window = Math.max(state.window, rows.length - index + 10);
+    state.stickBottom = false;
+    renderList();
+    return (
+      [...$('list').children].find((n) => n.dataset && n.dataset.id === id) || null
+    );
+  }
+
+  function goToMatch() {
+    if (matchAt < 0 || matchAt >= matches.length) return clearMatches();
+    // The outline is persistent rather than a flash: it marks where you are in
+    // the set, and a flash would have faded by the time the scroll settled.
+    const previous = $('list').querySelector('.bubble.found');
+    if (previous) previous.classList.remove('found');
+
+    const row = revealMessage(matches[matchAt]);
+    paintMatchBar();
+    if (!row) return toast('That message is not here any more');
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const bubble = row.querySelector('.bubble');
+    if (bubble) bubble.classList.add('found');
+  }
+
+  function stepMatch(delta) {
+    if (!matches.length) return;
+    const next = matchAt + delta;
+    if (next < 0 || next >= matches.length) return;
+    matchAt = next;
+    buzz(8);
+    goToMatch();
+  }
+
+  function paintMatchBar() {
+    const bar = $('match-bar');
+    if (!matches.length) {
+      bar.style.display = 'none';
+      return;
+    }
+    bar.style.display = 'flex';
+    $('match-note').textContent =
+      `${matchAt + 1} of ${matches.length} · “${matchQuery}”`;
+    // Ends of the set are disabled rather than wrapping. Silently looping back
+    // to the top reads as "it did nothing" the first time it happens.
+    $('match-prev').disabled = matchAt <= 0;
+    $('match-next').disabled = matchAt >= matches.length - 1;
+  }
+
+  function clearMatches() {
+    matches = [];
+    matchAt = -1;
+    matchQuery = '';
+    const marked = $('list').querySelector('.bubble.found');
+    if (marked) marked.classList.remove('found');
+    paintMatchBar();
+  }
+
+  /* ==================================================================== *
    * Wiring
    * ==================================================================== */
 
@@ -3470,6 +3700,26 @@
     });
     $('reply-cancel').addEventListener('click', clearReply);
     $('edit-cancel').addEventListener('click', cancelEdit);
+
+    $('search-btn').addEventListener('click', openSearch);
+    $('search-close').addEventListener('click', closeSearch);
+    $('search-input').addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => runSearch($('search-input').value), 140);
+    });
+    $('search-input').addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') return closeSearch();
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      // Enter goes straight to the newest match — the one the list puts first,
+      // and nine times in ten the one being looked for.
+      clearTimeout(searchTimer);
+      runSearch($('search-input').value);
+      if (searchHits.length) jumpTo(searchHits[searchHits.length - 1].message.id);
+    });
+    $('match-prev').addEventListener('click', () => stepMatch(-1));
+    $('match-next').addEventListener('click', () => stepMatch(1));
+    $('match-close').addEventListener('click', clearMatches);
     $('menu').addEventListener('click', openMenuSheet);
     $('device-banner').addEventListener('click', openDevicesSheet);
     $('scrim').addEventListener('click', () => {

@@ -194,6 +194,13 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 #reply-strip .grow{flex:1;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 #edit-strip{display:none;align-items:center;gap:8px;margin:2px 4px 6px;padding:6px 8px;
             background:var(--surface);border-left:3px solid #E8C36A;border-radius:8px;font-size:13px;color:var(--muted);}
+#match-bar{display:none;align-items:center;gap:2px;margin:2px 4px 6px;padding:4px 4px 4px 10px;
+           background:var(--surface);border-left:3px solid var(--accent);border-radius:8px;
+           font-size:13px;color:var(--muted);}
+#match-bar .grow{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#match-bar button{min-width:38px;min-height:38px;font-size:15px;border-radius:9px;}
+#match-bar button:disabled{opacity:.3;}
+#match-bar button:not(:disabled):active{background:var(--surface-2);}
 .inputrow{display:flex;align-items:flex-end;gap:4px;}
 #text{
   flex:1;resize:none;border:0;outline:0;background:var(--surface);
@@ -253,6 +260,34 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;line-height:1.9;
       letter-spacing:.04em;background:var(--bg);padding:12px;border-radius:12px;word-spacing:6px;}
 
+/* ---------------- Search ----------------
+   Its own layer rather than a mode of the thread: the results list and the
+   conversation want opposite scroll anchoring, and sharing one scroller meant
+   whichever ran last decided where the eye ended up. */
+#search{position:fixed;inset:0;z-index:12;background:var(--bg);
+        display:none;flex-direction:column;}
+#search.on{display:flex;}
+.search-top{display:flex;align-items:center;gap:6px;flex:0 0 auto;
+            padding:calc(var(--safe-top) + 8px) 8px 8px;border-bottom:1px solid var(--line);}
+#search-input{flex:1;min-width:0;border:0;outline:0;background:var(--surface);
+              border-radius:20px;padding:11px 14px;min-height:44px;}
+#search-input::placeholder{color:#5d7d87;}
+#search-note{flex:0 0 auto;padding:10px 14px 4px;color:var(--muted);font-size:13px;}
+#search-results{flex:1;overflow-y:auto;overscroll-behavior:contain;
+                padding:4px 8px calc(12px + var(--kb) + var(--safe-bottom));}
+.hit{display:block;width:100%;text-align:left;color:inherit;
+     padding:10px 12px;margin-bottom:6px;border-radius:12px;background:var(--surface);}
+.hit:active{background:var(--surface-2);}
+.hit-who{display:flex;justify-content:space-between;gap:10px;
+         font-size:12px;color:var(--muted);margin-bottom:3px;}
+.hit-who b{color:var(--text);font-weight:600;}
+.hit-text{font-size:14.5px;line-height:1.4;white-space:pre-wrap;
+          word-wrap:break-word;overflow-wrap:anywhere;}
+.hit-text mark{background:var(--accent);color:var(--accent-ink);border-radius:3px;padding:0 1px;}
+/* Where the jump landed. Without it you are returned to the thread at some
+   arbitrary scroll position with nothing saying which bubble you came for. */
+.bubble.found{outline:2px solid var(--accent);outline-offset:2px;}
+
 /* ---------------- Viewer ---------------- */
 #viewer{position:fixed;inset:0;background:#000;z-index:20;display:none;
         align-items:center;justify-content:center;touch-action:none;}
@@ -289,6 +324,8 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 @media (min-width: 900px){
   #hdr,#composer{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
   #scroller{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
+  .search-top,#search-note,#search-results{
+    padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
   .banner{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
   /* A share of the column, not of the monitor. */
   .bubble{max-width:min(78%,560px);}
@@ -329,6 +366,7 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         <b id="peer-name">Reef</b>
         <span id="peer-state">connecting…</span>
       </div>
+      <button class="tap" id="search-btn" aria-label="Search">🔍</button>
       <button class="tap" id="menu" aria-label="More">⋯</button>
     </header>
 
@@ -356,6 +394,14 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         <span class="grow" id="edit-note"></span>
         <button class="tap" id="edit-cancel" aria-label="Cancel edit">✕</button>
       </div>
+      <!-- Stays after the search panel closes, so a result set can be walked
+           through in the thread rather than one hit at a time. -->
+      <div id="match-bar">
+        <span class="grow" id="match-note"></span>
+        <button class="tap" id="match-prev" aria-label="Older match">↑</button>
+        <button class="tap" id="match-next" aria-label="Newer match">↓</button>
+        <button class="tap" id="match-close" aria-label="Clear search">✕</button>
+      </div>
       <!-- What is attached but not yet sent. Previously invisible: a toast, then
            nothing until it went. -->
       <div id="staged"></div>
@@ -375,6 +421,18 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
   </section>
 
 </div>
+
+<!-- Search. Local by necessity, not by omission: the server stores ciphertext
+     and holds no key, so there is nothing there to index. -->
+<section id="search">
+  <div class="search-top">
+    <input id="search-input" type="search" placeholder="Search this conversation…"
+           autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="search">
+    <button class="tap" id="search-close" aria-label="Close search">✕</button>
+  </div>
+  <div id="search-note"></div>
+  <div id="search-results"></div>
+</section>
 
 <div id="scrim"></div>
 <div id="sheet"></div>

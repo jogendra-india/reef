@@ -12,6 +12,8 @@ PIN is the identity, so there is no username to type.
   ciphertext and holds no key
 - A new device gets in only after the *other* person approves it
 - Edit within 5 minutes, delete for everyone, hide for me, reply, react
+- Search the conversation, stepping match by match through the thread — run
+  against this device's own store, because the server has nothing to index
 - Typing indicator, presence, delivery and read ticks
 - Works offline: history reads from IndexedDB and anything composed while
   offline queues in an outbox and sends itself on reconnect
@@ -117,5 +119,7 @@ Two things follow from the design and surprise people:
 - **Web push on iOS needs the app on the Home Screen** (iOS 16.4+). In a normal
   Safari tab there are no notifications at all.
 - **No haptics on iOS** — the vibration API does not exist there.
-- **Search is local.** The server cannot index what it cannot read.
+- **Search only reaches what this device holds.** The server cannot index what
+  it cannot read, so search runs against the local store — which means a device
+  that starts from an empty thread has nothing to search until it fills up.
 - The server still sees metadata: who, when, and how big.
