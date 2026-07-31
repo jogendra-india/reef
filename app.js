@@ -97,7 +97,8 @@
     messages: new Map(),
     profiles: {},
     me: { handle: 'Fish', emoji: '🐟' },
-    window: 60,
+    // How much of the thread is rendered. See viewBounds.
+    view: { tail: 0, count: 60 },
     replyTo: null,
     editing: null,
     stream: null,
@@ -387,7 +388,8 @@
     state.profiles = {};
     state.recipients = [];
     state.pairKeys = {};
-    state.window = 60;
+    state.view = { tail: 0, count: 60 };
+    invalidateOrder();
     state.unseen = 0;
     state.devices = [];
     state.pendingDevices = [];
@@ -614,6 +616,7 @@
       DB.entries(DB.STORES.profiles),
     ]);
     stored.forEach((m) => state.messages.set(m.id, m));
+    invalidateOrder();
     state.profiles = profiles;
     renderList();
   }
@@ -711,7 +714,24 @@
       state.messages.set(m.id, m);
     });
     if (decoded.length) await DB.putMessages(decoded);
-    if (prepend) state.window += decoded.length;
+    // Counted before the cache is dropped, so `tail` can be held against what
+    // arrives.
+    const lengthBefore = ordered().length;
+    if (decoded.length) invalidateOrder();
+
+    if (prepend) {
+      // Reveal what was just loaded: the window is end-relative, so a prepend
+      // alone would leave the visible set unchanged.
+      state.view.count += decoded.length;
+      trimView();
+    } else if (state.view.tail) {
+      // Scrolled back into history, and something new has arrived at the far
+      // end. `tail` counts from the newest, so leaving it alone would slide the
+      // window forward under the reader — one older message dropped and one
+      // newer gained, for every message the other person sends.
+      const added = ordered().length - lengthBefore;
+      if (added > 0) state.view.tail += added;
+    }
     renderList(prepend);
     markVisibleRead();
     confirmDelivery(decoded);
@@ -894,19 +914,95 @@
     message.kind === 'system' ||
     !!(message.body && message.body.type === 'profile');
 
-  const chronological = () =>
-    [...state.messages.values()].sort((a, b) => (a.seq || 1e15) - (b.seq || 1e15));
+  /* The sorted thread, cached.
+   *
+   * Both of these ran on every render — a full sort of every message held, to
+   * answer a scroll event or repaint one tick. Renders vastly outnumber changes
+   * to the set, so the answer is kept until something actually changes it. */
+  let orderCache = null;
+  let chronoCache = null;
 
-  const ordered = () => chronological().filter((m) => !isSystem(m));
+  function invalidateOrder() {
+    orderCache = null;
+    chronoCache = null;
+  }
+
+  const chronological = () => {
+    if (!chronoCache) {
+      chronoCache = [...state.messages.values()].sort(
+        (a, b) => (a.seq || 1e15) - (b.seq || 1e15)
+      );
+    }
+    return chronoCache;
+  };
+
+  const ordered = () => {
+    if (!orderCache) orderCache = chronological().filter((m) => !isSystem(m));
+    return orderCache;
+  };
+
+  /* ==================================================================== *
+   * The rendered window
+   * ==================================================================== *
+   *
+   * At most MAX_ROWS are ever in the DOM. renderList rebuilds every visible row
+   * from scratch, so an unbounded window meant a long scroll back made every
+   * later repaint — a tick, a reaction — proportionally slower, and it only ever
+   * grew within a session.
+   *
+   * Measured from the *end*, not as absolute indices: loading older messages
+   * puts them at the front of the sorted array and shifts every index, whereas
+   * "how many from the newest" survives that untouched.
+   *
+   *   end   = length - tail
+   *   start = end - count
+   */
+  const MAX_ROWS = 200;
+  const PAGE_ROWS = 40;
+
+  function viewBounds(rows) {
+    const end = Math.max(0, rows.length - state.view.tail);
+    return { start: Math.max(0, end - state.view.count), end };
+  }
+
+  /* Holds the window at its cap by dropping from the newest end, which keeps
+   * `start` exactly where widening put it. */
+  function trimView() {
+    if (state.view.count <= MAX_ROWS) return;
+    state.view.tail += state.view.count - MAX_ROWS;
+    state.view.count = MAX_ROWS;
+  }
 
   function renderList(keepAnchor) {
     const scroller = $('scroller');
-    const before = scroller.scrollHeight;
     const list = $('list');
+
+    /* Which message is at the top edge, and exactly where.
+     *
+     * The old compensation was `scrollTop += scrollHeight - before`, which works
+     * only while content is added *above*. A capped window also drops rows from
+     * the other end, and then the height delta is the sum of both changes and
+     * says nothing useful. Putting a known row back where it was is exact
+     * either way. */
+    let anchorId = null;
+    let anchorTop = 0;
+    if (keepAnchor) {
+      const edge = scroller.getBoundingClientRect().top;
+      const held = [...list.children].find(
+        (node) => node.dataset && node.dataset.id &&
+                  node.getBoundingClientRect().bottom > edge
+      );
+      if (held) {
+        anchorId = held.dataset.id;
+        anchorTop = held.getBoundingClientRect().top;
+      }
+    }
+
     list.innerHTML = '';
 
     const rows = ordered();
-    const visible = rows.slice(Math.max(0, rows.length - state.window));
+    const { start, end } = viewBounds(rows);
+    const visible = rows.slice(start, end);
 
     let lastDay = null;
     for (let index = 0; index < visible.length; index++) {
@@ -955,11 +1051,13 @@
       list.appendChild(renderRow(message, { grouped, tail }));
     }
 
-    if (keepAnchor) {
-      // Prepending without this is why so many such apps jerk when you scroll
-      // up: the content grows above the viewport and the browser keeps the
-      // same scrollTop.
-      scroller.scrollTop += scroller.scrollHeight - before;
+    if (anchorId) {
+      // Without this the thread jerks as you scroll up: content grows above the
+      // viewport and the browser keeps the same scrollTop.
+      const back = list.querySelector(`[data-id="${CSS.escape(anchorId)}"]`);
+      if (back) {
+        scroller.scrollTop += back.getBoundingClientRect().top - anchorTop;
+      }
     } else if (state.stickBottom) {
       scrollToBottom(false);
     }
@@ -1283,6 +1381,13 @@
   }
 
   function scrollToBottom(smooth) {
+    // Scrolled far enough back that the newest messages are no longer rendered:
+    // pinning to the foot of the DOM would stop at whatever the window ends on.
+    if (state.view.tail) {
+      state.view.tail = 0;
+      state.view.count = Math.min(MAX_ROWS, Math.max(60, state.view.count));
+      renderList();
+    }
     pinToBottom(smooth);
     state.unseen = 0;
     paintPill();
@@ -1470,6 +1575,7 @@
     // On screen before the network is even consulted. The composer never waits
     // for a round trip.
     state.messages.set(id, optimistic);
+    invalidateOrder();
     state.stickBottom = true;
     renderList();
     scrollToBottom(true);
@@ -1551,7 +1657,9 @@
 
     const message = state.messages.get(job.id);
     if (message) {
+      // A real seq moves it in the sorted order, so the cache is stale.
       message.seq = result.seq;
+      invalidateOrder();
       message.state = 'sent';
       message.body = body;
       message.attachments = result.attachments || [];
@@ -3034,6 +3142,7 @@
     // Never reaches the server. "Delete for me" that quietly deleted the other
     // person's copy would be a lie.
     state.messages.delete(message.id);
+    invalidateOrder();
     await DB.del(DB.STORES.messages, message.id);
     renderList();
   }
@@ -3694,7 +3803,10 @@
    * not. */
   function jumpTo(id) {
     (searchRows || []).forEach((m) => {
-      if (!state.messages.has(m.id)) state.messages.set(m.id, m);
+      if (!state.messages.has(m.id)) {
+        state.messages.set(m.id, m);
+        invalidateOrder();
+      }
     });
     matches = searchHits.map((h) => h.message.id);
     matchQuery = searchQuery;
@@ -3703,13 +3815,22 @@
     goToMatch();
   }
 
-  /* Widens the window just far enough to reach one message, rather than
-   * rendering the entire history to get at something from March. */
+  /* Centres the window on one message.
+   *
+   * This used to widen the window until it reached back far enough, which for a
+   * match from March meant rendering March to today — the thing the cap exists
+   * to prevent. Moving the window costs the same whatever the distance. */
   function revealMessage(id) {
     const rows = ordered();
     const index = rows.findIndex((m) => m.id === id);
     if (index < 0) return null;
-    state.window = Math.max(state.window, rows.length - index + 10);
+    state.view.count = MAX_ROWS;
+    // Centred where there is room on both sides. The upper clamp is what keeps a
+    // window full: without it, a match near the oldest message pushed `end` below
+    // the cap and rendered a stunted window with the match jammed against the
+    // top of it.
+    const centred = rows.length - index - Math.ceil(MAX_ROWS / 2);
+    state.view.tail = Math.max(0, Math.min(centred, Math.max(0, rows.length - MAX_ROWS)));
     state.stickBottom = false;
     renderList();
     return (
@@ -3857,12 +3978,15 @@
       () => {
         const distance =
           scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
-        state.stickBottom = distance < 120;
+        // The foot of a trimmed window is not the foot of the conversation, so
+        // sticking to the bottom means both.
+        state.stickBottom = !state.view.tail && distance < 120;
         if (state.stickBottom && state.unseen) {
           state.unseen = 0;
           paintPill();
         }
-        if (scroller.scrollTop < 600) growWindow();
+        if (scroller.scrollTop < 600) growOlder();
+        else if (distance < 600 && state.view.tail) growNewer();
       },
       { passive: true }
     );
@@ -3874,16 +3998,27 @@
   }
 
   let growing = false;
-  async function growWindow() {
+  /* Older, on scrolling up. Once the window reaches the oldest message held, the
+   * next page comes from the server. */
+  async function growOlder() {
     if (growing) return;
     const rows = ordered();
-    if (state.window >= rows.length) {
+    if (viewBounds(rows).start === 0) {
       growing = true;
       await loadOlder();
       growing = false;
       return;
     }
-    state.window += 40;
+    state.view.count += PAGE_ROWS;
+    trimView();
+    renderList(true);
+  }
+
+  /* Newer, on scrolling back down. Only reachable when the cap has pushed the
+   * window off the end of the thread — otherwise there is nothing newer to show. */
+  function growNewer() {
+    if (!state.view.tail) return;
+    state.view.tail = Math.max(0, state.view.tail - PAGE_ROWS);
     renderList(true);
   }
 
