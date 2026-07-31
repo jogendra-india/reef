@@ -1783,6 +1783,16 @@
     // One sheet per gesture. On Android a long press fires contextmenu *and*
     // trips the hold timer, and both want to open it.
     let opened = false;
+    /* Which pointer is actually pressed, if any.
+     *
+     * pointermove fires on plain hover with a mouse, and there was nothing here
+     * saying "only while held". startX begins at 0, so moving the cursor over a
+     * message gave dx = clientX — several hundred pixels — which clamped to the
+     * full 64px of swipe travel and slid the bubble sideways. It also passed the
+     * 48px threshold, so _armed was set and the next click silently opened a
+     * reply to whatever had been hovered. Touch never showed it: there,
+     * pointermove only happens while a finger is down. */
+    let holding = null;
 
     const cancelHold = () => {
       clearTimeout(holdTimer);
@@ -1792,6 +1802,9 @@
     row.addEventListener(
       'pointerdown',
       (event) => {
+        // A right-click is the context menu, not the start of a swipe.
+        if (event.pointerType === 'mouse' && event.button !== 0) return;
+        holding = event.pointerId;
         startX = event.clientX;
         startY = event.clientY;
         axis = null;
@@ -1811,6 +1824,7 @@
     row.addEventListener(
       'pointermove',
       (event) => {
+        if (holding === null || event.pointerId !== holding) return;
         const dx = event.clientX - startX;
         const dy = event.clientY - startY;
         if (Math.abs(dx) > 10 || Math.abs(dy) > 10) moved = true;
@@ -1834,6 +1848,7 @@
     );
 
     const release = () => {
+      holding = null;
       cancelHold();
       bubble.style.transition = '';
       bubble.style.transform = '';
@@ -2043,7 +2058,7 @@
              state.notifications ? 'Notifications on' : 'Notifications off',
              async () => {
                await setNotifications(!state.notifications);
-               state.notifications = await notificationsOn();
+               state.notifications = await notificationsActive();
              });
       action('🔑', 'Safety number', openSafetySheet);
       action('🐠', 'Change my fish', openProfileSheet);
@@ -2798,7 +2813,7 @@
    * ==================================================================== */
 
   async function loadProfileSettings() {
-    state.notifications = await notificationsOn();
+    state.notifications = await notificationsActive();
     // Shared across rooms: you are the same fish everywhere.
     const stored = await DB.profile();
     state.me = stored || DEFAULT_PROFILE[state.session.slot] || { handle: 'Fish', emoji: '🐟' };
@@ -3000,9 +3015,14 @@
   async function setNotifications(on) {
     await DB.setNotifications(on ? 'on' : 'off');
     if (on) {
-      await subscribePush();
-      toast('Notifications on');
-      return;
+      // The one place that may prompt, because this is a tap. It reports what
+      // actually happened rather than announcing success either way — and puts
+      // the setting back if it did not, so the bell never claims to be on while
+      // nothing is subscribed.
+      const ready = await subscribePush({ ask: true });
+      if (ready) toast('Notifications on');
+      else await DB.setNotifications('off');
+      return ready;
     }
     try {
       const registration = await navigator.serviceWorker.ready;
@@ -3014,17 +3034,60 @@
     toast('Notifications off — nothing will arrive while the app is closed');
   }
 
+  // The stored preference: what the bell was last set to.
   const notificationsOn = async () => (await DB.notifications()) !== 'off';
 
-  async function subscribePush() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    if (!state.session.vapid_public_key) return;
-    // Asked for once and remembered. Re-subscribing on every unlock would
-    // silently undo the bell.
-    if (!(await notificationsOn())) return;
+  /* Whether notifications are actually going to arrive, which is the preference
+   * *and* the browser's permission. The bell read the preference alone, so a
+   * fresh device — where nothing has been granted and nothing is subscribed —
+   * showed "Notifications on". */
+  const notificationsActive = async () =>
+    (await notificationsOn()) &&
+    typeof Notification !== 'undefined' &&
+    Notification.permission === 'granted';
+
+  let pushBusy = false;
+
+  /* Registers this device for push.
+   *
+   * `ask` is the whole design. requestPermission() used to run on every unlock,
+   * so the browser's dialog reappeared each time — and a prompt nobody asked for
+   * gets dismissed rather than answered, which leaves the permission at
+   * "default" and lets it be asked again, until Chrome decides the repeated
+   * dismissals mean no. That is the "it comes back, and only works on the third
+   * try" loop.
+   *
+   * So it is only ever asked from a tap on the bell. An unlock re-subscribes
+   * silently when permission has already been granted, and does nothing at all
+   * otherwise. */
+  async function subscribePush({ ask = false } = {}) {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      if (ask) toast('This browser cannot do notifications');
+      return false;
+    }
+    if (!state.session || !state.session.vapid_public_key) return false;
+    if (!(await notificationsOn())) return false;
+    // Two of these at once means two dialogs, and the second one arrives after
+    // the first has been answered — which is what made it look like Allow had
+    // not worked.
+    if (pushBusy) return false;
+    pushBusy = true;
+
     try {
-      const permission = await Notification.requestPermission();
-      if (permission !== 'granted') return;
+      if (Notification.permission === 'denied') {
+        if (ask) {
+          toast('Notifications are blocked for this site — allow them in the browser');
+        }
+        return false;
+      }
+      if (Notification.permission !== 'granted') {
+        if (!ask) return false;
+        if ((await Notification.requestPermission()) !== 'granted') {
+          toast('Notifications not allowed');
+          return false;
+        }
+      }
+
       const registration = await navigator.serviceWorker.ready;
       const existing = await registration.pushManager.getSubscription();
       const subscription =
@@ -3040,8 +3103,14 @@
         auth: json.keys.auth,
         privacy: (await DB.get(DB.STORES.settings, 'privacy')) || 'hidden',
       });
+      return true;
     } catch (e) {
-      /* notifications are a nicety, never a blocker */
+      // Swallowed silently before, so a subscription that failed after the
+      // permission was granted looked exactly like one that had worked.
+      if (ask) toast('Could not turn notifications on — try once more');
+      return false;
+    } finally {
+      pushBusy = false;
     }
   }
 
