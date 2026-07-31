@@ -11,10 +11,17 @@
   'use strict';
 
   // Two kinds of database. `reef` holds the device key and the session map —
-  // things that span rooms. Every room then gets its own `reef-<id>`, so one
+  // things that span rooms. Every room then gets its own database, so one
   // conversation's history cannot be read while another is open. That is a
   // structural guarantee rather than a filter someone has to remember to
   // apply on every query.
+  //
+  // The name carries the *seat* as well as the room, because a room has two of
+  // them and one device can be used by both. It was keyed on the room alone, so
+  // entering the other PIN on the same browser opened the first person's store:
+  // their decrypted history, their unsent draft, and every `mine` flag computed
+  // for them, which drew their messages as yours. Splitting the name is what
+  // makes that impossible rather than merely unlikely.
   const NAME = 'reef';
   const VERSION = 1;
   let roomName = null;
@@ -33,8 +40,15 @@
   /* Points the per-room stores at one conversation. Called on unlock and on
    * every switch; the open handle is dropped so the next read reopens against
    * the new room rather than answering from the previous one. */
-  function useRoom(roomId) {
-    const next = roomId ? `${NAME}-${roomId}` : NAME;
+  function roomDbName(roomId, slot) {
+    if (!roomId) return NAME;
+    // Without a slot there is nothing to separate the two seats by, so fall back
+    // to the old name rather than inventing one and stranding the history.
+    return slot ? `${NAME}-${roomId}-s${slot}` : `${NAME}-${roomId}`;
+  }
+
+  function useRoom(roomId, slot) {
+    const next = roomDbName(roomId, slot);
     if (next === roomName) return;
     roomName = next;
     if (handle) {
@@ -223,6 +237,77 @@
     });
   }
 
+  /* Copies a room's history out of the pre-seat store into this seat's.
+   *
+   * Renaming the database would otherwise look exactly like losing the
+   * conversation. Both seats may adopt it — the rows are the same messages, and
+   * each seat needs its own copy anyway — so the old store is left alone rather
+   * than moved. It stops being written to from here on, and `wipeEverything`
+   * already matches it.
+   *
+   * Returns the number of messages taken, so the caller knows to re-derive
+   * `mine`: the copied flags were computed for whoever wrote them.
+   */
+  async function adoptLegacyRoom(roomId) {
+    if (!roomId || !roomName || roomName === NAME) return 0;
+    const legacyName = `${NAME}-${roomId}`;
+    if (legacyName === roomName) return 0;
+
+    // Opening a database that does not exist creates it, so ask first where the
+    // browser can tell us. Where it cannot, an empty one is harmless.
+    if (indexedDB.databases) {
+      try {
+        const present = await indexedDB.databases();
+        if (!present.some((d) => d.name === legacyName)) return 0;
+      } catch (e) {
+        /* fall through and try to open it */
+      }
+    }
+
+    // Only ever into an empty store: this runs on every unlock, and a second
+    // pass must not resurrect messages that were hidden for me since.
+    const already = await run(STORES.messages, 'readonly', (s) => s.count());
+    if (already) return 0;
+
+    const legacy = await new Promise((resolve) => {
+      const request = indexedDB.open(legacyName, VERSION);
+      request.onupgradeneeded = () => {
+        // Brand new, so there was nothing to adopt.
+        request.transaction.abort();
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = request.onblocked = () => resolve(null);
+    });
+    if (!legacy) return 0;
+
+    const readAll = (store) =>
+      new Promise((resolve) => {
+        if (!legacy.objectStoreNames.contains(store)) return resolve([[], []]);
+        const tx = legacy.transaction(store, 'readonly');
+        const target = tx.objectStore(store);
+        const keys = target.getAllKeys();
+        const values = target.getAll();
+        tx.oncomplete = () => resolve([keys.result || [], values.result || []]);
+        tx.onerror = () => resolve([[], []]);
+      });
+
+    try {
+      const [, messages] = await readAll(STORES.messages);
+      if (messages.length) await putMessages(messages);
+      // Handles and fish, so the header is right before the first system
+      // message of this session arrives.
+      const [profileKeys, profileValues] = await readAll(STORES.profiles);
+      for (let i = 0; i < profileKeys.length; i++) {
+        await put(STORES.profiles, profileValues[i], profileKeys[i]);
+      }
+      // Deliberately not `settings`: the draft belongs to whoever typed it, and
+      // carrying it over is one of the leaks this split exists to close.
+      return messages.length;
+    } finally {
+      legacy.close();
+    }
+  }
+
   root.ReefDB = {
     STORES,
     open,
@@ -232,6 +317,7 @@
     all,
     entries,
     clearAll,
+    adoptLegacyRoom,
     messagesPage,
     putMessages,
     highestSeq,
@@ -245,8 +331,12 @@
     /* Drops the tokens and nothing else. What a revoked device needs: it can no
      * longer fetch, but the messages it already holds are still its own. */
     forgetSessions: () => putShared({}, 'sessions'),
-    profile: () => getShared('me'),
-    setProfile: (value) => putShared(value, 'me'),
+    /* Per seat, not per device. It was one shared `me`, on the grounds that you
+     * are the same fish everywhere — true across *rooms*, false across the two
+     * seats of one room, where it handed the other person's handle and emoji to
+     * whoever logged in next and then announced it as theirs. */
+    profile: (slot) => getShared(slot ? `me-s${slot}` : 'me'),
+    setProfile: (value, slot) => putShared(value, slot ? `me-s${slot}` : 'me'),
     // Shared rather than per-room, and deliberately: it is a property of this
     // device, the service worker has to be able to read it with no page open,
     // and muting one conversation while another shouts is not a thing anybody

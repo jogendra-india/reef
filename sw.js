@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v23';
-const BUILD = '2026-07-31d';
+const CACHE = 'reef-shell-v24';
+const BUILD = '2026-07-31e';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -224,8 +224,9 @@ async function lookInRoom(roomId, session, identity, messageId) {
 
   // Profiles are per-room, and the worker has never pointed the store at one —
   // so this read went to the shared database, which does not hold them, and
-  // every notification was from "Someone".
-  self.ReefDB.useRoom(roomId);
+  // every notification was from "Someone". The slot comes along too, or this
+  // would open the seat-less name and find nothing again.
+  self.ReefDB.useRoom(roomId, session.slot);
   const profile =
     (await self.ReefDB.get(self.ReefDB.STORES.profiles, sender.id)) || {};
   return {

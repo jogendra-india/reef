@@ -405,10 +405,11 @@
     clearReply();
     cancelEdit();
 
-    DB.useRoom(roomId);
-    state.roomId = roomId;
-
     const session = state.sessions[roomId];
+    // Seat, not just room: one browser can be used by both people in a
+    // conversation, and they must not share a store.
+    DB.useRoom(roomId, session.slot);
+    state.roomId = roomId;
     API.setToken(session.token);
 
     if (prefetched) {
@@ -435,6 +436,8 @@
       return;
     }
     showScreen('pool');
+    // The conversation is on screen now, so the idle clock applies.
+    idleReset();
     refreshRequests();
     // A device waiting for approval only ever announced itself through a live
     // WebSocket event. Anyone who was not looking at the screen at that moment
@@ -443,8 +446,12 @@
     refreshDevices();
     watchDevices();
     await loadProfileSettings();
-    await hydrateFromLocal();
     await refreshKeys();
+    // After refreshKeys, because re-deriving `mine` on the copied rows needs to
+    // know which devices are ours; before hydrate, so the thread is painted once,
+    // already correct.
+    await adoptLegacyHistory();
+    await hydrateFromLocal();
     // Before the stream, so the header is right from the first paint rather than
     // waiting for an event that may never come.
     seedPresence();
@@ -559,6 +566,47 @@
   /* ==================================================================== *
    * History
    * ==================================================================== */
+
+  /* Takes over a conversation stored before the per-seat split.
+   *
+   * The store used to be named for the room alone, so renaming it would read as
+   * losing the thread. The rows are copied across once, and their `mine` flags
+   * re-derived: they were computed for whichever seat wrote them, and on the
+   * other seat every one of them is backwards.
+   *
+   * Only the last 400 are corrected locally — the same window hydrate reads —
+   * because `isOwnDevice` cannot speak for a device that has since been revoked
+   * and is no longer in `recipients`. Anything the server still lists gets the
+   * authoritative answer from the next sync anyway.
+   */
+  async function adoptLegacyHistory() {
+    let taken = 0;
+    try {
+      taken = await DB.adoptLegacyRoom(state.roomId);
+    } catch (e) {
+      return; // nothing to adopt, or it could not be opened
+    }
+    if (!taken) return;
+
+    // Offline, or before the key list has arrived, `isOwnDevice` cannot answer —
+    // and guessing would put messages on the wrong side. The copied flags are
+    // already right for the overwhelmingly common case of one person per device,
+    // and the next sync settles the rest, so leave them be.
+    if (!state.recipients || !state.recipients.length) return;
+
+    try {
+      const stored = await DB.messagesPage(400);
+      const fixed = stored.filter((message) => {
+        const ours = isOwnDevice(message.senderDeviceId);
+        if (message.mine === ours) return false;
+        message.mine = ours;
+        return true;
+      });
+      if (fixed.length) await DB.putMessages(fixed);
+    } catch (e) {
+      /* the sync will correct what it can reach */
+    }
+  }
 
   async function hydrateFromLocal() {
     const [stored, profiles] = await Promise.all([
@@ -2681,7 +2729,7 @@
           handle: input.value.trim() || fishName(emoji) || 'Fish',
           emoji,
         };
-        await DB.setProfile(state.me);
+        await DB.setProfile(state.me, state.session.slot);
         closeSheet();
         announceProfile();
         toast('Saved');
@@ -3024,7 +3072,7 @@
   async function loadProfileSettings() {
     state.notifications = await notificationsActive();
     // Shared across rooms: you are the same fish everywhere.
-    const stored = await DB.profile();
+    const stored = await DB.profile(state.session.slot);
     state.me = stored || DEFAULT_PROFILE[state.session.slot] || { handle: 'Fish', emoji: '🐟' };
     const draft = await DB.get(DB.STORES.settings, 'draft');
     if (draft) {
@@ -3381,6 +3429,7 @@
 
   async function lockNow() {
     state.locked = true;
+    idleStop();
     // Written before the screen changes, so a reload racing the tap still finds
     // it locked. The live socket goes too: a locked app has no business
     // heartbeating presence or taking delivery of anything.
@@ -3399,10 +3448,50 @@
     showScreen('lock');
   }
 
+  /* Locks a conversation left open and untouched.
+   *
+   * Auto-lock only ever triggered on *returning* from somewhere else, so a
+   * conversation left open on a desk stayed open indefinitely — the case where
+   * somebody walks past and reads it.
+   *
+   * It counts only while the screen is actually in front of you: the timer stops
+   * when the tab is hidden and starts again from zero on return, so switching
+   * away is not itself a reason to lock.
+   *
+   * Deliberately only genuine input resets it. Scroll events fire from
+   * `scrollToBottom` too, so a talkative peer would otherwise hold the session
+   * open with nobody present.
+   */
+  const IDLE_LOCK = 2 * 60 * 1000;
+  let idleTimer = null;
+
+  function idleReset() {
+    clearTimeout(idleTimer);
+    if (state.locked || document.visibilityState !== 'visible') return;
+    idleTimer = setTimeout(() => {
+      if (!state.locked) lockNow();
+    }, IDLE_LOCK);
+  }
+
+  function idleStop() {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+
+  function watchIdle() {
+    ['pointerdown', 'keydown', 'wheel', 'touchstart', 'input'].forEach((type) =>
+      document.addEventListener(type, idleReset, { passive: true, capture: true })
+    );
+    idleReset();
+  }
+
   function watchVisibility() {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
         state.hiddenAt = Date.now();
+        // Away is not idle: the clock stops rather than running down while you
+        // are somewhere else.
+        idleStop();
         // The app-switcher preview is a screenshot. Blank it.
         $('privacy').classList.add('on');
       } else {
@@ -3412,6 +3501,8 @@
         } else {
           markVisibleRead();
           flushOutbox();
+          // Back on screen, so the idle clock starts again from zero.
+          idleReset();
         }
         state.hiddenAt = null;
       }
@@ -3807,6 +3898,7 @@
     wire();
     trackKeyboard();
     watchVisibility();
+    watchIdle();
 
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('./sw.js').catch(() => {});
@@ -3865,7 +3957,7 @@
       // only show the waiting screen.
       const roomId =
         roomIds.find((id) => sessions[id].status === 'active') || roomIds[0];
-      DB.useRoom(roomId);
+      DB.useRoom(roomId, sessions[roomId].slot);
       state.roomId = roomId;
       API.setToken(sessions[roomId].token);
       try {
@@ -3880,6 +3972,11 @@
           state.locked = false;
           showScreen('pool');
           await loadProfileSettings();
+          // Also here, and not only in afterUnlock. The very first load after
+          // the per-seat split may well be an offline one, and without this the
+          // new store is empty and the whole conversation reads as gone — the
+          // old rows are still on disk, but nobody is looking at them.
+          await adoptLegacyHistory();
           await hydrateFromLocal();
           paintHeader();
           return;
