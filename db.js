@@ -253,6 +253,15 @@
     // asked for.
     notifications: () => getShared('notifications'),
     setNotifications: (value) => putShared(value, 'notifications'),
+    /* Whether this browser is locked.
+     *
+     * Locking was a screen swap and nothing more, so the next load read the
+     * stored token and walked straight back into the conversation — which made
+     * both "Lock now" and the five-minute auto-lock decorative, and meant
+     * handing someone a locked phone handed them the thread. It has to outlive
+     * the page, so it lives beside the tokens it is guarding. */
+    locked: () => getShared('locked'),
+    setLocked: (value) => putShared(!!value, 'locked'),
     async wipeEverything() {
       // Signing out has to take the shared vault too, or the next person to
       // use this browser inherits its keys and tokens.

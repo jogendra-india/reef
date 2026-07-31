@@ -38,10 +38,54 @@
     toastTimer = setTimeout(() => node.classList.remove('on'), 2600);
   }
 
-  const FISH = ['🐟', '🐠', '🐡', '🦑', '🐙', '🦀', '🦐', '🐳', '🐬', '🦈', '🪸', '🐚'];
+  /* Each fish carries its own name, because picking one is how most people name
+   * themselves here — the handle was a separate box you had to notice and edit,
+   * so everybody stayed "Pufferfish" while wearing a shark.
+   *
+   * Unicode has no goldfish. 🐠 is the gold-and-orange one, so it wears the
+   * name; the striped "Clownfish" it used to be called was the less accurate of
+   * the two readings anyway.
+   *
+   * Three rows of eight in the picker's 8-column grid. A handful are recent
+   * additions to Unicode — 🪼 and 🌊-era glyphs aside, 🦭 🦪 🦞 🦦 🧽 all
+   * postdate 2018 — so a genuinely old phone may draw one as a box. It is
+   * cosmetic: the emoji travels as text either way, and the name beside it says
+   * what it was meant to be. */
+  const FISH = [
+    ['🐠', 'Goldfish'],
+    ['🐡', 'Pufferfish'],
+    ['🐟', 'Minnow'],
+    ['🦈', 'Shark'],
+    ['🐬', 'Dolphin'],
+    ['🐳', 'Whale'],
+    ['🐋', 'Humpback'],
+    ['🦭', 'Seal'],
+    ['🦦', 'Otter'],
+    ['🐧', 'Penguin'],
+    ['🐢', 'Turtle'],
+    ['🐊', 'Crocodile'],
+    ['🐙', 'Octopus'],
+    ['🦑', 'Squid'],
+    ['🪼', 'Jellyfish'],
+    ['🦐', 'Shrimp'],
+    ['🦞', 'Lobster'],
+    ['🦀', 'Crab'],
+    ['🦪', 'Oyster'],
+    ['🐚', 'Shell'],
+    ['🪸', 'Coral'],
+    ['🧽', 'Sponge'],
+    ['🦠', 'Plankton'],
+    ['🌊', 'Wave'],
+  ];
+  const fishName = (emoji) => (FISH.find(([e]) => e === emoji) || [])[1];
+  /* A handle that is still the name of some fish has never been typed over, so
+   * it should follow the next fish picked. Type anything of your own and it
+   * stops following — which is the "until I change it" part. */
+  const isFishName = (handle) => FISH.some(([, name]) => name === handle);
+
   const DEFAULT_PROFILE = {
     1: { handle: 'Pufferfish', emoji: '🐡' },
-    2: { handle: 'Clownfish', emoji: '🐠' },
+    2: { handle: 'Goldfish', emoji: '🐠' },
   };
 
   const state = {
@@ -297,6 +341,10 @@
     entry = '';
     paintDots();
     state.locked = false;
+    // The PIN is what lifts the lock, and the only thing that does. Cleared
+    // here rather than on arrival in the room, so a room that fails to open
+    // does not leave the app locked against a PIN the server just accepted.
+    await DB.setLocked(false).catch(() => {});
     await enterRoom(preferred.room_id, preferred);
   }
 
@@ -346,6 +394,7 @@
     state.peerLive = [];
     state.peerOnline = false;
     state.lastSeen = null;
+    deliveredSent.clear();
     // Attachments belong to the conversation they were picked for.
     clearStaged();
     paintDeviceBanner();
@@ -471,6 +520,11 @@
     }
     paintHeader();
     paintPeerMissing();
+    // Whoever just appeared has to be told who you are, and this is the one
+    // function every route to a changed recipient list passes through — unlock,
+    // a device event, the divergence check in refreshDevices. Guarded and
+    // deduplicated internally, so calling it freely is safe.
+    announceProfile();
   }
 
   function pairKeyFor(deviceId) {
@@ -515,18 +569,32 @@
   async function syncHistory() {
     try {
       const since = await DB.highestSeq();
-      const result = since
-        ? await API.history({ since, page_size: 200 })
-        : await API.history({ page_size: 60 });
-      await ingest(result.results || []);
+      // Two different questions, and `since` can only answer one of them.
+      //
+      // The cursor brings messages this device has not seen. But a receipt does
+      // not move a message's seq, so a tick answered while this device was away
+      // is on the wrong side of the cursor forever — which is the single tick
+      // that never becomes a double no matter how long you wait. The only way to
+      // see it is to re-read the tail and take the server's word for it.
+      const [fresh, tail] = await Promise.all([
+        since
+          ? API.history({ since, page_size: 200 })
+          : API.history({ page_size: 60 }),
+        since ? API.history({ page_size: 40 }) : null,
+      ]);
+      await ingest(fresh.results || []);
+      if (tail) await ingest(tail.results || []);
     } catch (err) {
       if (!err.offline) console.warn('sync failed', err);
     }
   }
 
   async function loadOlder() {
-    const oldest = [...state.messages.values()].sort((a, b) => a.seq - b.seq)[0];
-    if (!oldest) return;
+    // chronological() sorts a message still being sent to the end, which is what
+    // this wants: its seq is null, and `cursor=null` asks the server for the
+    // wrong page entirely.
+    const oldest = chronological()[0];
+    if (!oldest || !oldest.seq) return;
     try {
       const result = await API.history({ cursor: oldest.seq, page_size: 60 });
       await ingest(result.results || [], true);
@@ -563,8 +631,12 @@
         editedAt: row.edited_at,
         deleted: row.deleted,
         attachments: row.attachments || [],
-        reactions: row.reactions || [],
-        receipts: row.receipts || [],
+        // Falling back to what is already held rather than to empty. A row that
+        // arrives without these — an endpoint that omits them, a trimmed
+        // payload — used to wipe receipts and reactions learned live, which on a
+        // reconnect turned a pair of ticks back into one.
+        reactions: row.reactions || (existing && existing.reactions) || [],
+        receipts: row.receipts || (existing && existing.receipts) || [],
         state: 'sent',
       });
       // The placeholder body is truthy, so `!merged.body` alone meant a message
@@ -590,6 +662,42 @@
     if (prepend) state.window += decoded.length;
     renderList(prepend);
     markVisibleRead();
+    confirmDelivery(decoded);
+  }
+
+  // Ids this device has already told the server about, so a re-read of the tail
+  // does not re-send the same confirmation on every reconnect.
+  const deliveredSent = new Set();
+
+  /* Confirms receipt of anything that arrived, however it arrived.
+   *
+   * This used to live in the msg.new handler alone, so a message was only ever
+   * confirmed if it landed while the socket happened to be open and this screen
+   * happened to be running. Everything picked up by a history sync — the app was
+   * closed, backgrounded, mid-reconnect — was never acknowledged at all, and the
+   * sender sat on one tick for a message sitting right there on the other
+   * person's phone. */
+  function confirmDelivery(messages) {
+    if (!state.device || state.device.status !== 'active') return;
+    const mine = String(state.device.id);
+    const ids = messages
+      .filter(
+        (m) =>
+          !m.mine &&
+          !isSystem(m) &&
+          !deliveredSent.has(m.id) &&
+          !(m.receipts || []).some(
+            (r) => String(r.device_id) === mine && r.delivered_at
+          )
+      )
+      .map((m) => m.id);
+    if (!ids.length) return;
+    ids.forEach((id) => deliveredSent.add(id));
+    API.receipts(ids, 'delivered').catch(() => {
+      // Offline, most likely. Forget them again so the next sync retries rather
+      // than leaving the sender on one tick permanently.
+      ids.forEach((id) => deliveredSent.delete(id));
+    });
   }
 
   async function tryOpen(row) {
@@ -720,8 +828,24 @@
     return !body.text && !(message.attachments || []).length;
   }
 
-  const ordered = () =>
+  /* Housekeeping, not conversation: the profile announcement that carries a
+   * handle and a fish travels as an ordinary encrypted message so the server
+   * never learns either.
+   *
+   * It has no text and no attachment, which is exactly what `unreadable` looks
+   * for — so every announcement drew "One earlier message cannot be opened on
+   * this device" in the middle of the thread. Your own were guaranteed to: an
+   * envelope is sealed per recipient and never for yourself, so the copy that
+   * comes back from the server is one you genuinely hold no key for. Changing
+   * your fish therefore always produced that line, on both sides. */
+  const isSystem = (message) =>
+    message.kind === 'system' ||
+    !!(message.body && message.body.type === 'profile');
+
+  const chronological = () =>
     [...state.messages.values()].sort((a, b) => (a.seq || 1e15) - (b.seq || 1e15));
+
+  const ordered = () => chronological().filter((m) => !isSystem(m));
 
   function renderList(keepAnchor) {
     const scroller = $('scroller');
@@ -1902,18 +2026,67 @@
 
   const QUICK = ['❤️', '😂', '👍', '🐟', '😮', '🙏'];
 
+  // Whatever this device has already put on a message, so the row can show it
+  // rather than offering six identical-looking choices one of which is already
+  // taken.
+  const myReaction = (message) =>
+    ((message.reactions || []).find(
+      (r) => String(r.device_id) === String(state.device.id)
+    ) || {}).emoji;
+
+  /* The whole emoji catalogue, for a reaction.
+   *
+   * The six quick ones cover most of it and stay one tap away, but they were
+   * also the *only* ones — so the composer could send any emoji in the app and a
+   * reaction could be one of six. Same list the composer draws from, so there is
+   * one catalogue rather than two that drift. */
+  function openReactionPicker(message) {
+    const current = myReaction(message);
+    openSheet((sheet) => {
+      sheet.appendChild(el('div', 'sheet-title', 'React with anything.'));
+      const panel = el('div', 'picker');
+      Object.entries(EMOJI).forEach(([group, list]) => {
+        panel.appendChild(el('div', 'emoji-head', group));
+        const grid = el('div', 'emoji-grid');
+        list.forEach((emoji) => {
+          const button = el('button', null, emoji);
+          button.type = 'button';
+          if (emoji === current) button.classList.add('picked');
+          button.addEventListener('click', () => {
+            closeSheet();
+            sendReaction(message, emoji);
+          });
+          grid.appendChild(button);
+        });
+        panel.appendChild(grid);
+      });
+      sheet.appendChild(panel);
+    });
+  }
+
   function openMessageSheet(message) {
     openSheet((sheet) => {
       if (!message.deleted) {
+        const current = myReaction(message);
         const reacts = el('div', 'quickreacts');
         QUICK.forEach((emoji) => {
           const button = el('button', null, emoji);
+          button.type = 'button';
+          if (emoji === current) button.classList.add('picked');
           button.addEventListener('click', () => {
             closeSheet();
             sendReaction(message, emoji);
           });
           reacts.appendChild(button);
         });
+        // The way out of the six. Marked when the reaction already on this
+        // message is not one of them, so it never looks like nothing is chosen.
+        const more = el('button', 'more', '＋');
+        more.type = 'button';
+        more.setAttribute('aria-label', 'More reactions');
+        if (current && QUICK.indexOf(current) < 0) more.classList.add('picked');
+        more.addEventListener('click', () => openReactionPicker(message));
+        reacts.appendChild(more);
         sheet.appendChild(reacts);
       }
 
@@ -2448,30 +2621,62 @@
   function openProfileSheet() {
     openSheet((sheet) => {
       sheet.appendChild(el('div', 'sheet-title', 'How you appear to the other side.'));
+
+      // Nothing is committed until Save. state.me used to be mutated on the tap,
+      // so dismissing the sheet left this device wearing a fish it had never
+      // announced — and the other side still seeing the old one.
+      let emoji = state.me.emoji;
+      let follows = !state.me.handle || isFishName(state.me.handle);
+
+      // The one thing that was missing: seeing the pair you are choosing. The
+      // fish is picked in one place, the name typed in another, and neither
+      // showed the result.
+      const card = el('div', 'sheet-title');
+      card.style.cssText += ';text-align:center;font-size:17px;color:var(--text)';
+      sheet.appendChild(card);
+
       const input = el('input');
       input.value = state.me.handle;
       input.maxLength = 24;
       input.style.cssText =
         'width:100%;padding:12px;border-radius:12px;background:var(--bg);border:1px solid var(--line);margin-bottom:10px';
+      const paint = () => {
+        card.textContent = `${emoji} ${input.value.trim() || fishName(emoji) || 'Fish'}`;
+      };
+      input.addEventListener('input', () => {
+        follows = isFishName(input.value.trim()) || !input.value.trim();
+        paint();
+      });
       sheet.appendChild(input);
 
       const grid = el('div', 'emoji-grid');
-      FISH.forEach((emoji) => {
-        const button = el('button', null, emoji);
+      FISH.forEach(([fish, name]) => {
+        const button = el('button', null, fish);
+        button.type = 'button';
+        button.title = name;
+        button.setAttribute('aria-label', name);
         button.addEventListener('click', () => {
-          state.me.emoji = emoji;
-          [...grid.children].forEach((c) => (c.style.background = ''));
-          button.style.background = 'var(--surface-2)';
+          emoji = fish;
+          // The whole point: the fish names you, right up until you name
+          // yourself.
+          if (follows) input.value = name;
+          [...grid.children].forEach((c) => c.classList.remove('picked'));
+          button.classList.add('picked');
+          paint();
         });
-        if (emoji === state.me.emoji) button.style.background = 'var(--surface-2)';
+        if (fish === emoji) button.classList.add('picked');
         grid.appendChild(button);
       });
       sheet.appendChild(grid);
+      paint();
 
       const save = el('button', 'act', 'Save');
       save.style.justifyContent = 'center';
       save.addEventListener('click', async () => {
-        state.me.handle = input.value.trim() || state.me.handle;
+        state.me = {
+          handle: input.value.trim() || fishName(emoji) || 'Fish',
+          emoji,
+        };
         await DB.setProfile(state.me);
         closeSheet();
         announceProfile();
@@ -2825,13 +3030,27 @@
   }
 
   async function announceProfile() {
-    if (!state.recipients.length) return;
-    const signature = JSON.stringify(state.me);
-    const last = await DB.get(DB.STORES.settings, 'me-announced');
-    if (last === signature) return;
-    const id = uuid();
-    const body = { v: 1, type: 'profile', handle: state.me.handle, emoji: state.me.emoji };
     try {
+      if (!state.recipients.length) return;
+      // Who was told, as well as what. The signature used to be the profile
+      // alone, so a device that joined after the last announcement never heard
+      // one — it saw "Reef" in the header and a nameless peer in Details, and
+      // nothing short of renaming yourself would fix it. Re-announcing when the
+      // recipient list changes costs one small message and is the only moment
+      // the new device can be reached.
+      const signature = JSON.stringify([
+        state.me,
+        state.recipients.map((r) => String(r.id)).sort(),
+      ]);
+      const last = await DB.get(DB.STORES.settings, 'me-announced');
+      if (last === signature) return;
+      const id = uuid();
+      const body = {
+        v: 1,
+        type: 'profile',
+        handle: state.me.handle,
+        emoji: state.me.emoji,
+      };
       const envelopes = await sealFor(body, id);
       await API.send({ id, kind: 'system', envelopes, attachment_ids: [] });
       await DB.put(DB.STORES.settings, signature, 'me-announced');
@@ -2870,21 +3089,23 @@
   let typingTimer;
   async function handleEvent(event) {
     switch (event.type) {
-      case 'msg.new':
+      // The delivered receipt is no longer sent from here. ingest confirms
+      // everything it takes in, which covers this *and* the history sync that
+      // used to acknowledge nothing.
+      case 'msg.new': {
         await ingest([event.message]);
-        if (!event.message.mine) {
+        // A profile announcement is not a ripple. Counting one meant changing
+        // your fish told the other person they had a new message.
+        const arrived = state.messages.get(event.message.id);
+        if (!event.message.mine && !(arrived && isSystem(arrived))) {
           if (!state.stickBottom) {
             state.unseen += 1;
             paintPill();
           }
           buzz(12);
-          try {
-            await API.receipts([event.message.id], 'delivered');
-          } catch (e) {
-            /* best effort */
-          }
         }
         break;
+      }
 
       case 'msg.edit': {
         const message = state.messages.get(event.id);
@@ -2941,13 +3162,21 @@
       case 'receipt': {
         const message = state.messages.get(event.message_id);
         if (message) {
+          const who = String(event.device_id);
+          // Merged, not replaced, and compared as strings. A "read" event
+          // carries no delivered_at, so replacing wholesale threw away the
+          // delivery this device had already been told about — and an id that
+          // arrived as a number one time and a string the next produced two
+          // entries for the same device.
+          const known =
+            (message.receipts || []).find((r) => String(r.device_id) === who) || {};
           message.receipts = (message.receipts || []).filter(
-            (r) => r.device_id !== event.device_id
+            (r) => String(r.device_id) !== who
           );
           message.receipts.push({
             device_id: event.device_id,
-            delivered_at: event.delivered_at,
-            read_at: event.read_at,
+            delivered_at: event.delivered_at || known.delivered_at || null,
+            read_at: event.read_at || known.read_at || null,
           });
           await DB.putMessages([message]);
           refreshRow(message);
@@ -3146,10 +3375,16 @@
     location.reload();
   }
 
-  function lockNow() {
+  async function lockNow() {
     state.locked = true;
+    // Written before the screen changes, so a reload racing the tap still finds
+    // it locked. The live socket goes too: a locked app has no business
+    // heartbeating presence or taking delivery of anything.
+    await DB.setLocked(true).catch(() => {});
     clearInterval(devicesTimer);
     clearInterval(presenceTimer);
+    if (state.stream) state.stream.close();
+    state.stream = null;
     entry = '';
     paintDots();
     $('lock-note').textContent = '';
@@ -3365,8 +3600,16 @@
 
     const sessions = await DB.sessions();
     const roomIds = Object.keys(sessions);
-    if (roomIds.length) {
+    // A lock has to survive the page. Otherwise "Lock now" and the five-minute
+    // auto-lock only hid the screen, and pull-to-refresh — or simply reopening
+    // the PWA — put the conversation straight back on it.
+    const wasLocked = await DB.locked().catch(() => false);
+    if (roomIds.length && !wasLocked) {
       state.sessions = sessions;
+      // Nothing set this on the way in, only unlockWith did — so after any
+      // refresh the app ran with locked still true, and watchVisibility's
+      // `!state.locked` guard meant auto-lock could never fire again.
+      state.locked = false;
       await ensureIdentity();
       // Prefer a room this device is actually approved in; a pending one can
       // only show the waiting screen.
