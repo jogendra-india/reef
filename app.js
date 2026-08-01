@@ -750,7 +750,7 @@
         // arrives without these — an endpoint that omits them, a trimmed
         // payload — used to wipe receipts and reactions learned live, which on a
         // reconnect turned a pair of ticks back into one.
-        reactions: mergeReactions(row.reactions, existing),
+        reactions: mergeReactions(await decryptReactions(row, existing), existing),
         receipts: row.receipts || (existing && existing.receipts) || [],
         state: 'sent',
       });
@@ -843,6 +843,64 @@
    * reaches my laptop through the server like anybody else's, so holding those
    * locally too would mean a stale copy that nothing could ever clear.
    */
+  // Up to three per person. The body used to be a single emoji; both shapes are
+  // read, because messages reacted to before this exist and are not going to
+  // rewrite themselves.
+  const MAX_REACTIONS = 3;
+  const emojiOf = (reaction) =>
+    (reaction && reaction.emojis) ||
+    (reaction && reaction.emoji ? [reaction.emoji] : []);
+
+  const myReactionList = (message) =>
+    emojiOf(
+      (message.reactions || []).find(
+        (r) => state.device && String(r.device_id) === String(state.device.id)
+      )
+    );
+
+  /* Turns the ciphertext the history hands back into emoji.
+   *
+   * Reactions were only ever decrypted in the live WebSocket handler, so one
+   * that arrived while this device was away — or simply survived a reload —
+   * came back as {device_id, ct, iv, salt}, was dropped by the renderer for
+   * having no emoji, and was then written over the decrypted copy on disk. The
+   * other person's reactions disappeared on refresh for that reason, quite
+   * separately from the sender's own.
+   */
+  async function decryptReactions(row, existing) {
+    const out = [];
+    for (const reaction of row.reactions || []) {
+      const id = String(reaction.device_id);
+      // Already opened once — keep it rather than paying for it again, and
+      // rather than losing it if the key has since gone.
+      const known = ((existing && existing.reactions) || []).find(
+        (r) => String(r.device_id) === id && emojiOf(r).length
+      );
+      if (known) {
+        out.push(known);
+        continue;
+      }
+      if (!reaction.ct) {
+        if (emojiOf(reaction).length) out.push(reaction);
+        continue;
+      }
+      const key = pairKeyFor(reaction.device_id);
+      if (!key) continue;
+      try {
+        const body = await C.openMessage(key, reaction, {
+          messageId: row.id + '#reaction',
+          senderDeviceId: reaction.device_id,
+          recipientDeviceId: state.device.id,
+        });
+        const emojis = emojiOf(body);
+        if (emojis.length) out.push({ device_id: reaction.device_id, emojis });
+      } catch (e) {
+        /* sealed for a device since replaced */
+      }
+    }
+    return out;
+  }
+
   function mergeReactions(fromServer, existing) {
     const here = (r) => state.device && String(r.device_id) === String(state.device.id);
     const theirs = (fromServer || []).filter((r) => !here(r));
@@ -1201,10 +1259,14 @@
       // and nothing about which was which.
       const reacts = el('div', 'reacts');
       message.reactions.forEach((reaction) => {
-        if (!reaction.emoji) return;
-        // Yours as a person, not merely from this device.
+        const emojis = emojiOf(reaction);
+        if (!emojis.length) return;
+        // One pill per person holding all of theirs, so three emoji from one
+        // person read as one person rather than as three.
         const own = isOwnDevice(reaction.device_id);
-        reacts.appendChild(el('span', 'react' + (own ? ' own' : ''), reaction.emoji));
+        reacts.appendChild(
+          el('span', 'react' + (own ? ' own' : ''), emojis.join(' '))
+        );
       });
       if (reacts.children.length) {
         reacts.title = 'Who reacted';
@@ -2278,13 +2340,6 @@
   const QUICK_DEFAULT = ['❤️', '😂', '👍', '🐟', '😮', '🙏'];
   const quickReacts = () => topEmoji(6, QUICK_DEFAULT);
 
-  // Whatever this device has already put on a message, so the row can show it
-  // rather than offering six identical-looking choices one of which is already
-  // taken.
-  const myReaction = (message) =>
-    ((message.reactions || []).find(
-      (r) => String(r.device_id) === String(state.device.id)
-    ) || {}).emoji;
 
   /* The whole emoji catalogue, for a reaction.
    *
@@ -2293,7 +2348,7 @@
    * reaction could be one of six. Same list the composer draws from, so there is
    * one catalogue rather than two that drift. */
   function openReactionPicker(message) {
-    const current = myReaction(message);
+    const current = myReactionList(message);
     openSheet((sheet) => {
       sheet.appendChild(el('div', 'sheet-title', 'React with anything.'));
       const panel = el('div', 'picker');
@@ -2303,10 +2358,10 @@
         list.forEach((emoji) => {
           const button = el('button', null, emoji);
           button.type = 'button';
-          if (emoji === current) button.classList.add('picked');
+          if (current.includes(emoji)) button.classList.add('picked');
           button.addEventListener('click', () => {
             closeSheet();
-            sendReaction(message, emoji);
+            toggleReaction(message, emoji);
           });
           grid.appendChild(button);
         });
@@ -2319,15 +2374,15 @@
   function openMessageSheet(message) {
     openSheet((sheet) => {
       if (!message.deleted) {
-        const current = myReaction(message);
+        const current = myReactionList(message);
         const reacts = el('div', 'quickreacts');
         quickReacts().forEach((emoji) => {
           const button = el('button', null, emoji);
           button.type = 'button';
-          if (emoji === current) button.classList.add('picked');
+          if (current.includes(emoji)) button.classList.add('picked');
           button.addEventListener('click', () => {
             closeSheet();
-            sendReaction(message, emoji);
+            toggleReaction(message, emoji);
           });
           reacts.appendChild(button);
         });
@@ -2336,7 +2391,7 @@
         const more = el('button', 'more', '＋');
         more.type = 'button';
         more.setAttribute('aria-label', 'More reactions');
-        if (current && quickReacts().indexOf(current) < 0) more.classList.add('picked');
+        if (current.some((e) => quickReacts().indexOf(e) < 0)) more.classList.add('picked');
         more.addEventListener('click', () => openReactionPicker(message));
         reacts.appendChild(more);
         sheet.appendChild(reacts);
@@ -2436,11 +2491,11 @@
         });
       }
 
-      const reactions = (message.reactions || []).filter((r) => r.emoji);
+      const reactions = (message.reactions || []).filter((r) => emojiOf(r).length);
       if (reactions.length) {
         sheet.appendChild(el('div', 'sheet-title', 'Reactions'));
         reactions.forEach((reaction) => {
-          line(whoIs(reaction.device_id), reaction.emoji);
+          line(whoIs(reaction.device_id), emojiOf(reaction).join(' '));
         });
       }
     });
@@ -3296,39 +3351,60 @@
     renderList();
   }
 
-  async function sendReaction(message, emoji) {
-    noteEmoji(emoji);
-    const payload = {};
-    for (const recipient of state.recipients) {
-      const key = pairKeyFor(recipient.id);
-      if (!key) continue;
-      payload[recipient.id] = await C.sealMessage(
-        key,
-        { emoji },
-        {
-          messageId: message.id + '#reaction',
-          senderDeviceId: state.device.id,
-          recipientDeviceId: recipient.id,
-        }
-      );
+  /* Adds or removes one emoji from my reaction to a message.
+   *
+   * A person gets up to three. The server never sees any of them — the payload
+   * is opaque ciphertext keyed by recipient device — so carrying a list rather
+   * than a single emoji needed nothing of it: the row it keeps is still one per
+   * sender per message, which is exactly what the unique constraint wants.
+   *
+   * Tapping one you already have takes it off, and taking off the last one
+   * clears the reaction entirely, which an empty payload tells the server to do.
+   */
+  async function toggleReaction(message, emoji) {
+    const current = myReactionList(message);
+    let emojis;
+    if (current.includes(emoji)) {
+      emojis = current.filter((e) => e !== emoji);
+    } else if (current.length >= MAX_REACTIONS) {
+      return toast(`Three at most — tap one of yours to take it off`);
+    } else {
+      emojis = [...current, emoji];
+      noteEmoji(emoji);
     }
+
+    const payload = {};
+    if (emojis.length) {
+      for (const recipient of state.recipients) {
+        const key = pairKeyFor(recipient.id);
+        if (!key) continue;
+        payload[recipient.id] = await C.sealMessage(
+          key,
+          { emojis },
+          {
+            messageId: message.id + '#reaction',
+            senderDeviceId: state.device.id,
+            recipientDeviceId: recipient.id,
+          }
+        );
+      }
+    }
+
     // Kept so a failed send can put it back, rather than leaving a reaction on
     // screen that the other person will never see.
     const before = (message.reactions || []).slice();
-
     message.reactions = (message.reactions || []).filter(
       (r) => String(r.device_id) !== String(state.device.id)
     );
-    message.reactions.push({ device_id: state.device.id, emoji });
+    if (emojis.length) {
+      message.reactions.push({ device_id: state.device.id, emojis });
+    }
     refreshRow(message);
 
-    /* Written to the store, not merely to the object on screen.
-     *
-     * This was the whole of the disappearing-reaction bug: the reaction lived in
-     * memory and nowhere else, so a refresh reloaded the message from disk
-     * without it — and since nothing in a reaction is addressed to its sender,
-     * the server could not supply it either. Between the two, the only copy was
-     * the one the reload had just thrown away. */
+    /* Written to the store, not merely to the object on screen. The reaction
+     * lived in memory and nowhere else, so a refresh reloaded the message from
+     * disk without it — and since nothing in a reaction is addressed to its
+     * sender, the server could not supply it either. */
     await DB.putMessages([message]).catch(() => {});
 
     try {
@@ -3340,6 +3416,7 @@
       toast('Reaction did not stick');
     }
   }
+
 
   /* ==================================================================== *
    * Profile broadcast
@@ -3466,7 +3543,7 @@
         const message = state.messages.get(event.message_id);
         if (!message) break;
         message.reactions = (message.reactions || []).filter(
-          (r) => r.device_id !== event.device_id
+          (r) => String(r.device_id) !== String(event.device_id)
         );
         if (!event.cleared) {
           const key = pairKeyFor(event.device_id);
@@ -3477,7 +3554,10 @@
                 senderDeviceId: event.device_id,
                 recipientDeviceId: state.device.id,
               });
-              message.reactions.push({ device_id: event.device_id, emoji: body.emoji });
+              const emojis = emojiOf(body);
+              if (emojis.length) {
+                message.reactions.push({ device_id: event.device_id, emojis });
+              }
             } catch (e) {
               /* not for us */
             }
