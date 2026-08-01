@@ -462,6 +462,8 @@
     await flushOutbox();
     subscribePush();
     announceProfile();
+    // Last, and unawaited: housekeeping must never delay the conversation.
+    tidyLocalStore();
   }
 
   let approvalTimer = null;
@@ -607,6 +609,64 @@
       if (fixed.length) await DB.putMessages(fixed);
     } catch (e) {
       /* the sync will correct what it can reach */
+    }
+  }
+
+  /* Keeps the device's own copy from growing without limit.
+   *
+   * Two very different risks, so two rules.
+   *
+   * Messages are a cache. The server keeps every message and envelope for good —
+   * only ones given an explicit expiry are tombstoned — so dropping the oldest
+   * costs a round trip the next time somebody scrolls that far, and nothing else.
+   *
+   * Media is not a cache. The server deletes blobs after ninety days, so a photo
+   * older than that exists nowhere else, and evicting it would be the app quietly
+   * destroying the only copy. Only blobs the server could still hand back are
+   * ever dropped, largest first; the irreplaceable ones stay however old they
+   * get. That means storage is bounded in practice rather than in theory, which
+   * is the right way round for a messenger with no backup.
+   */
+  const LOCAL_MESSAGE_CAP = 5000;
+  const MEDIA_BUDGET = 150 * 1024 * 1024;
+  const SERVER_BLOB_DAYS = 90;
+
+  async function tidyLocalStore() {
+    try {
+      await DB.pruneMessages(LOCAL_MESSAGE_CAP);
+    } catch (e) {
+      /* nothing to prune, or the store is busy */
+    }
+
+    try {
+      const media = await DB.mediaEntries();
+      let held = media.reduce((sum, entry) => sum + entry.size, 0);
+      if (held <= MEDIA_BUDGET) return;
+
+      // Attachments the server would still serve. Anything not in here — too old,
+      // or belonging to a message already pruned — is left alone, because there
+      // is no way to get it back.
+      const cutoff = Date.now() - SERVER_BLOB_DAYS * 86400000;
+      const replaceable = new Set();
+      for (const message of await DB.messagesPage(LOCAL_MESSAGE_CAP)) {
+        if (!message.createdAt) continue;
+        if (new Date(message.createdAt).getTime() < cutoff) continue;
+        for (const attachment of message.attachments || []) {
+          replaceable.add(String(attachment.id));
+        }
+      }
+
+      const evictable = media
+        .filter((entry) => replaceable.has(String(entry.key).split(':')[0]))
+        .sort((a, b) => b.size - a.size);
+
+      for (const entry of evictable) {
+        if (held <= MEDIA_BUDGET) break;
+        await DB.del(DB.STORES.media, entry.key);
+        held -= entry.size;
+      }
+    } catch (e) {
+      /* leave it rather than risk deleting the wrong thing */
     }
   }
 
@@ -2413,6 +2473,7 @@
       action('🐠', 'Change my fish', openProfileSheet);
       action('📱', 'Devices', openDevicesSheet);
       action('🔢', 'Change PIN', () => openPinSheet());
+      action('💾', 'Storage', openStorageSheet);
       action('↻', 'Force refresh', forceRefresh);
       action('🔒', 'Lock now', lockNow);
       if (state.build) {
@@ -2421,6 +2482,62 @@
         stamp.style.cssText += ';text-align:center;padding-top:8px';
         sheet.appendChild(stamp);
       }
+    });
+  }
+
+  /* What this device is holding. Silent housekeeping is fine until somebody
+   * wonders where their disk went, so it is at least inspectable — and the one
+   * thing that is never dropped automatically is named, because "why is this
+   * still 400MB" has an answer. */
+  async function openStorageSheet() {
+    let media = [];
+    let messages = 0;
+    try {
+      media = await DB.mediaEntries();
+      messages = (await DB.messagesPage(LOCAL_MESSAGE_CAP + 1)).length;
+    } catch (e) {
+      /* shown as zero */
+    }
+    const held = media.reduce((sum, entry) => sum + entry.size, 0);
+    let quota = null;
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        quota = await navigator.storage.estimate();
+      }
+    } catch (e) {
+      /* not offered by this browser */
+    }
+
+    openSheet((sheet) => {
+      sheet.appendChild(
+        el('div', 'sheet-title', 'What this device is keeping for this conversation.')
+      );
+      const line = (label, value) => {
+        const row = el('div', 'act');
+        row.style.pointerEvents = 'none';
+        row.appendChild(el('span', null, label));
+        const right = el('span', null, value);
+        right.style.cssText = 'flex:1;text-align:right;color:var(--muted)';
+        row.appendChild(right);
+        sheet.appendChild(row);
+      };
+
+      line('Messages', `${messages}${messages > LOCAL_MESSAGE_CAP ? '+' : ''}`);
+      line('Photos and files', `${media.length} · ${fileSize(held)}`);
+      if (quota && quota.usage) {
+        line('This site altogether', fileSize(quota.usage));
+      }
+
+      sheet.appendChild(
+        el(
+          'div',
+          'sheet-title',
+          `Beyond ${LOCAL_MESSAGE_CAP} messages the oldest are dropped and fetched ` +
+            'again if you scroll back to them. Photos are only dropped while the ' +
+            'server could still send them — after ' + SERVER_BLOB_DAYS + ' days this ' +
+            'device holds the only copy, so those are kept whatever the size.'
+        )
+      );
     });
   }
 
@@ -3363,7 +3480,12 @@
         break;
       }
 
-      case 'typing':
+      case 'typing': {
+        // The server drops the echo to the device that sent it, which was enough
+        // while a person had one device. Your laptop's typing still reaches your
+        // phone, where it read as the other person composing a reply.
+        const who = String(event.device_id || '');
+        if (!who || !peerRecipients().some((r) => String(r.id) === who)) break;
         state.peerTyping = event.is_typing;
         paintHeader();
         clearTimeout(typingTimer);
@@ -3374,6 +3496,7 @@
           }, 4000);
         }
         break;
+      }
 
       case 'presence': {
         // The announce goes to the whole room, this device included, and it was
@@ -3921,20 +4044,48 @@
    * window rather than rendering everything since. The mark is cleared on the
    * next jump rather than by a timer: a flash would be over before a smooth
    * scroll across a long thread had finished. */
-  function goToMessage(id) {
+  async function goToMessage(id) {
     if (!id) return;
     const previous = $('list').querySelector('.bubble.found');
     if (previous) previous.classList.remove('found');
 
-    const row = revealMessage(id);
+    let row = revealMessage(id);
     if (!row) {
-      // Older than this device holds. Saying so beats doing nothing.
+      // Not in memory, which is not the same as not here: the thread holds only
+      // the most recent few hundred, and a reply can point at something far
+      // older that the store still has. Its neighbours come too, or it would
+      // arrive stranded between messages from months later.
+      row = await pullFromStore(id);
+    }
+    if (!row) {
+      // Genuinely beyond this device — pruned, or from before it was approved.
       return toast('That message is not on this device');
     }
     row.scrollIntoView({ block: 'center', behavior: 'smooth' });
     const bubble = row.querySelector('.bubble');
     if (bubble) bubble.classList.add('found');
     buzz(8);
+  }
+
+  /* Lifts one message and its neighbours off disk into the thread, then reveals
+   * it. Returns null when the store does not have it either. */
+  async function pullFromStore(id) {
+    try {
+      const anchor = await DB.get(DB.STORES.messages, id);
+      if (!anchor || !anchor.seq) return null;
+      const nearby = await DB.messagesAround(anchor.seq, 60);
+      let added = 0;
+      for (const message of nearby.length ? nearby : [anchor]) {
+        if (!state.messages.has(message.id)) {
+          state.messages.set(message.id, message);
+          added += 1;
+        }
+      }
+      if (added) invalidateOrder();
+      return revealMessage(id);
+    } catch (e) {
+      return null;
+    }
   }
 
   function goToMatch() {

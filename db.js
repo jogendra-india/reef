@@ -308,6 +308,79 @@
     }
   }
 
+  /* Drops the oldest messages beyond a cap.
+   *
+   * Safe in a way media is not: the server keeps every message and every
+   * envelope indefinitely — only messages given an explicit expiry are ever
+   * tombstoned — so a row removed here comes back on the next scroll into that
+   * part of the thread. The local store is a cache of what the server can still
+   * hand over, not the only copy.
+   *
+   * Walks the `seq` index, which skips anything still being sent: a message with
+   * no seq yet is not in the index, so the outbox cannot be pruned out from
+   * under itself.
+   */
+  async function pruneMessages(keep) {
+    const db = await open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORES.messages, 'readwrite');
+      const index = tx.objectStore(STORES.messages).index('seq');
+      const counter = index.count();
+      let removed = 0;
+      counter.onsuccess = () => {
+        const excess = counter.result - keep;
+        if (excess <= 0) return;
+        const cursor = index.openCursor(null, 'next'); // oldest first
+        cursor.onsuccess = () => {
+          const node = cursor.result;
+          if (!node || removed >= excess) return;
+          node.delete();
+          removed += 1;
+          node.continue();
+        };
+      };
+      tx.oncomplete = () => resolve(removed);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  /* A slice of the thread either side of one message, straight from disk.
+   *
+   * The thread in memory is only the most recent few hundred, so a reply to
+   * something from March cannot be reached through it — but the store usually
+   * still has it. Reading a span rather than the single message means it arrives
+   * with its neighbours instead of stranded between messages from months later.
+   */
+  async function messagesAround(seq, span) {
+    const db = await open();
+    return new Promise((resolve) => {
+      const out = [];
+      const range = IDBKeyRange.bound(seq - span, seq + span);
+      const tx = db.transaction(STORES.messages, 'readonly');
+      const cursor = tx.objectStore(STORES.messages).index('seq').openCursor(range);
+      cursor.onsuccess = () => {
+        const node = cursor.result;
+        if (!node) return resolve(out);
+        out.push(node.value);
+        node.continue();
+      };
+      cursor.onerror = () => resolve(out);
+    });
+  }
+
+  /* Every cached blob with its size. The Blobs come back as references rather
+   * than bytes, so asking for `.size` costs nothing. */
+  async function mediaEntries() {
+    const [keys, values] = await Promise.all([
+      run(STORES.media, 'readonly', (s) => s.getAllKeys()),
+      run(STORES.media, 'readonly', (s) => s.getAll()),
+    ]);
+    return keys.map((key, i) => ({
+      key,
+      size: (values[i] && values[i].size) || 0,
+    }));
+  }
+
   root.ReefDB = {
     STORES,
     open,
@@ -318,6 +391,9 @@
     entries,
     clearAll,
     adoptLegacyRoom,
+    pruneMessages,
+    mediaEntries,
+    messagesAround,
     messagesPage,
     putMessages,
     highestSeq,
