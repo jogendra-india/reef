@@ -335,6 +335,11 @@
      * are the same fish everywhere — true across *rooms*, false across the two
      * seats of one room, where it handed the other person's handle and emoji to
      * whoever logged in next and then announced it as theirs. */
+    /* How often this person has used each emoji, so the pickers can lead with
+     * the ones they actually reach for. Per seat, like the profile: it is a
+     * habit of the person, not of the browser. */
+    emojiUses: (slot) => getShared(slot ? `emoji-s${slot}` : 'emoji'),
+    setEmojiUses: (value, slot) => putShared(value, slot ? `emoji-s${slot}` : 'emoji'),
     profile: (slot) => getShared(slot ? `me-s${slot}` : 'me'),
     setProfile: (value, slot) => putShared(value, slot ? `me-s${slot}` : 'me'),
     // Shared rather than per-room, and deliberately: it is a property of this

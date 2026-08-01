@@ -1077,8 +1077,15 @@
 
     if (message.replyTo) {
       const target = state.messages.get(message.replyTo);
-      const quote = el('div', 'quote');
+      const quote = el('button', 'quote');
+      quote.type = 'button';
       quote.textContent = target && target.body ? preview(target) : 'a message';
+      // The quote said what was replied to and then would not take you there,
+      // which is the one thing anybody taps it for.
+      quote.addEventListener('click', (event) => {
+        event.stopPropagation();
+        goToMessage(message.replyTo);
+      });
       bubble.appendChild(quote);
     }
 
@@ -1109,24 +1116,30 @@
     bubble.appendChild(meta);
 
     if (message.reactions && message.reactions.length) {
+      // One pill holding every reaction, hung off the bottom edge of the bubble
+      // rather than placed inside it. In the flow it took a line of its own and
+      // grew the bubble, so reacting visibly resized the message.
       const reacts = el('div', 'reacts');
+      let anyOwn = false;
       message.reactions.forEach((reaction) => {
         if (!reaction.emoji) return;
-        // Two people reacting produced two identical-looking chips with nothing
-        // to say which was whose. Yours is marked, and the rest is in Details.
-        // Yours as a person, not just from this device.
-        const own = isOwnDevice(reaction.device_id);
-        reacts.appendChild(
-          el('span', 'react' + (own ? ' own' : ''), reaction.emoji)
-        );
+        // Yours as a person, not merely from this device.
+        if (isOwnDevice(reaction.device_id)) anyOwn = true;
+        reacts.appendChild(el('span', 'react', reaction.emoji));
       });
       if (reacts.children.length) {
+        // Which of them is yours is in Details; on the pill it is only worth
+        // knowing whether you are in it.
+        if (anyOwn) reacts.classList.add('own');
         reacts.title = 'Who reacted';
         reacts.addEventListener('click', (event) => {
           event.stopPropagation();
           openInfoSheet(message);
         });
         bubble.appendChild(reacts);
+        // The pill overhangs the bubble, so the row has to leave room for it or
+        // it lands on top of the next message.
+        row.classList.add('reacted');
       }
     }
 
@@ -2184,7 +2197,10 @@
     $('scrim').classList.remove('on');
   }
 
-  const QUICK = ['❤️', '😂', '👍', '🐟', '😮', '🙏'];
+  // Where the quick row starts before anybody has used the app. Once there is a
+  // tally it leads, so the six on offer are the six you actually send.
+  const QUICK_DEFAULT = ['❤️', '😂', '👍', '🐟', '😮', '🙏'];
+  const quickReacts = () => topEmoji(6, QUICK_DEFAULT);
 
   // Whatever this device has already put on a message, so the row can show it
   // rather than offering six identical-looking choices one of which is already
@@ -2205,7 +2221,7 @@
     openSheet((sheet) => {
       sheet.appendChild(el('div', 'sheet-title', 'React with anything.'));
       const panel = el('div', 'picker');
-      Object.entries(EMOJI).forEach(([group, list]) => {
+      Object.entries(emojiGroups()).forEach(([group, list]) => {
         panel.appendChild(el('div', 'emoji-head', group));
         const grid = el('div', 'emoji-grid');
         list.forEach((emoji) => {
@@ -2229,7 +2245,7 @@
       if (!message.deleted) {
         const current = myReaction(message);
         const reacts = el('div', 'quickreacts');
-        QUICK.forEach((emoji) => {
+        quickReacts().forEach((emoji) => {
           const button = el('button', null, emoji);
           button.type = 'button';
           if (emoji === current) button.classList.add('picked');
@@ -2244,7 +2260,7 @@
         const more = el('button', 'more', '＋');
         more.type = 'button';
         more.setAttribute('aria-label', 'More reactions');
-        if (current && QUICK.indexOf(current) < 0) more.classList.add('picked');
+        if (current && quickReacts().indexOf(current) < 0) more.classList.add('picked');
         more.addEventListener('click', () => openReactionPicker(message));
         reacts.appendChild(more);
         sheet.appendChild(reacts);
@@ -3148,6 +3164,7 @@
   }
 
   async function sendReaction(message, emoji) {
+    noteEmoji(emoji);
     const payload = {};
     for (const recipient of state.recipients) {
       const key = pairKeyFor(recipient.id);
@@ -3180,6 +3197,7 @@
 
   async function loadProfileSettings() {
     state.notifications = await notificationsActive();
+    await loadEmojiUses();
     // Shared across rooms: you are the same fish everywhere.
     const stored = await DB.profile(state.session.slot);
     state.me = stored || DEFAULT_PROFILE[state.session.slot] || { handle: 'Fish', emoji: '🐟' };
@@ -3622,6 +3640,54 @@
    * Emoji panel
    * ==================================================================== */
 
+  /* Which emoji this person actually reaches for.
+   *
+   * The catalogue is fixed and alphabetical-by-theme, so the one you send twenty
+   * times a day sits wherever it happened to be listed. Counting use lets both
+   * pickers lead with it, and the quick-react row stop being six constants
+   * chosen before anybody had used the app.
+   *
+   * Counts are a local habit and never leave the device — nothing here is sent
+   * anywhere, which also means the server learns nothing about what you like.
+   */
+  let emojiUses = {};
+  let emojiSaveTimer = null;
+
+  async function loadEmojiUses() {
+    try {
+      emojiUses = (await DB.emojiUses(state.session.slot)) || {};
+    } catch (e) {
+      emojiUses = {};
+    }
+  }
+
+  function noteEmoji(emoji) {
+    if (!emoji) return;
+    emojiUses[emoji] = (emojiUses[emoji] || 0) + 1;
+    // Tapping through a picker fires several of these; one write afterwards is
+    // enough.
+    clearTimeout(emojiSaveTimer);
+    emojiSaveTimer = setTimeout(
+      () => DB.setEmojiUses(emojiUses, state.session.slot).catch(() => {}),
+      400
+    );
+  }
+
+  /* Most used first, ties broken by the catalogue's own order so the list does
+   * not shuffle between renders. */
+  function topEmoji(count, fallback) {
+    const known = Object.entries(emojiUses)
+      .filter(([, n]) => n > 0)
+      .sort((a, b) => b[1] - a[1])
+      .map(([emoji]) => emoji);
+    const out = [];
+    for (const emoji of [...known, ...(fallback || [])]) {
+      if (out.length >= count) break;
+      if (!out.includes(emoji)) out.push(emoji);
+    }
+    return out;
+  }
+
   const EMOJI = {
     Reef: ['🐟', '🐠', '🐡', '🦈', '🐙', '🦑', '🦐', '🦀', '🐳', '🐬', '🪸', '🐚', '🌊', '⚓', '🏝️', '🫧'],
     Smileys: ['😀', '😄', '😅', '🤣', '😊', '🙂', '😉', '😍', '🥰', '😘', '😜', '🤪', '🤔', '🤗', '🙃', '😴',
@@ -3631,10 +3697,20 @@
     Life: ['🔥', '⭐', '🎉', '🎂', '🍕', '☕', '🍺', '🌙', '☀️', '🌈', '⚡', '🌸', '🍀', '🎵', '💤', '🚀'],
   };
 
+  /* The catalogue with the person's own most-used at the head of it. Rebuilt on
+   * each open rather than once at boot, or it would show the tally as it stood
+   * when the app started. */
+  function emojiGroups() {
+    const favourites = topEmoji(16, []);
+    return favourites.length
+      ? { 'Most used': favourites, ...EMOJI }
+      : EMOJI;
+  }
+
   function buildEmoji() {
     const panel = $('emoji');
     panel.innerHTML = '';
-    Object.entries(EMOJI).forEach(([group, list]) => {
+    Object.entries(emojiGroups()).forEach(([group, list]) => {
       panel.appendChild(el('div', 'emoji-head', group));
       const grid = el('div', 'emoji-grid');
       list.forEach((emoji) => {
@@ -3643,6 +3719,7 @@
         button.addEventListener('click', () => {
           const box = $('text');
           box.value += emoji;
+          noteEmoji(emoji);
           autogrow();
           saveDraft();
         });
@@ -3836,6 +3913,28 @@
     return (
       [...$('list').children].find((n) => n.dataset && n.dataset.id === id) || null
     );
+  }
+
+  /* Scrolls to one message and marks it, wherever it is in the thread.
+   *
+   * Shares revealMessage with search, so a reply from months ago costs a moved
+   * window rather than rendering everything since. The mark is cleared on the
+   * next jump rather than by a timer: a flash would be over before a smooth
+   * scroll across a long thread had finished. */
+  function goToMessage(id) {
+    if (!id) return;
+    const previous = $('list').querySelector('.bubble.found');
+    if (previous) previous.classList.remove('found');
+
+    const row = revealMessage(id);
+    if (!row) {
+      // Older than this device holds. Saying so beats doing nothing.
+      return toast('That message is not on this device');
+    }
+    row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    const bubble = row.querySelector('.bubble');
+    if (bubble) bubble.classList.add('found');
+    buzz(8);
   }
 
   function goToMatch() {
