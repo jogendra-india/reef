@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v27';
-const BUILD = '2026-08-01b';
+const CACHE = 'reef-shell-v28';
+const BUILD = '2026-08-01c';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -105,6 +105,14 @@ async function handlePush(event) {
     });
   }
 
+  // Before any of the decisions below, because none of them change the fact.
+  // "Delivered" meant "their app was open", since the only thing that confirmed
+  // it was the page ingesting the message — so anything that arrived while the
+  // other person's phone was locked sat on one tick until they next opened the
+  // app, however long that took. The push reaching this worker *is* delivery to
+  // the device, which is what the second tick is meant to say.
+  await confirmDelivery(payload.id);
+
   // Turned off in the app. The subscription is dropped when muting, so this
   // should not arrive at all — but a push already in flight would, and honouring
   // the setting here means "off" is never briefly untrue.
@@ -158,6 +166,41 @@ function show(content, payload) {
     vibrate: [60, 40, 60],
     data: { url: (payload && payload.url) || './' },
   });
+}
+
+/* Tells the server the message reached this device.
+ *
+ * The payload carries a message id and nothing else — not which conversation it
+ * belongs to — and working that out would mean fetching and decrypting, which
+ * the cheapest and most private notification path deliberately never does. So it
+ * is offered to every room this person holds a token for: the endpoint scopes by
+ * the token's own room and ignores a message that is not in it, and it ignores
+ * anything this person sent, so the wrong rooms are a no-op rather than a leak.
+ */
+async function confirmDelivery(messageId) {
+  if (!messageId) return;
+  let sessions = {};
+  try {
+    sessions = (await self.ReefDB.sessions()) || {};
+  } catch (e) {
+    return;
+  }
+  await Promise.all(
+    Object.values(sessions)
+      .filter((session) => session && session.token)
+      .map((session) =>
+        fetch(API_BASE + '/receipts/', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Token ' + session.token,
+          },
+          body: JSON.stringify({ message_ids: [messageId], state: 'delivered' }),
+        }).catch(() => {
+          // Offline, or a revoked token. The page confirms it on next open.
+        })
+      )
+  );
 }
 
 /* Reads the notification setting out of the shared store, which is where it
