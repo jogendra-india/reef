@@ -3312,14 +3312,31 @@
         }
       );
     }
+    // Kept so a failed send can put it back, rather than leaving a reaction on
+    // screen that the other person will never see.
+    const before = (message.reactions || []).slice();
+
     message.reactions = (message.reactions || []).filter(
-      (r) => r.device_id !== state.device.id
+      (r) => String(r.device_id) !== String(state.device.id)
     );
     message.reactions.push({ device_id: state.device.id, emoji });
     refreshRow(message);
+
+    /* Written to the store, not merely to the object on screen.
+     *
+     * This was the whole of the disappearing-reaction bug: the reaction lived in
+     * memory and nowhere else, so a refresh reloaded the message from disk
+     * without it — and since nothing in a reaction is addressed to its sender,
+     * the server could not supply it either. Between the two, the only copy was
+     * the one the reload had just thrown away. */
+    await DB.putMessages([message]).catch(() => {});
+
     try {
       await API.react(message.id, payload);
     } catch (e) {
+      message.reactions = before;
+      await DB.putMessages([message]).catch(() => {});
+      refreshRow(message);
       toast('Reaction did not stick');
     }
   }
