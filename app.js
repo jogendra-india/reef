@@ -750,7 +750,7 @@
         // arrives without these — an endpoint that omits them, a trimmed
         // payload — used to wipe receipts and reactions learned live, which on a
         // reconnect turned a pair of ticks back into one.
-        reactions: row.reactions || (existing && existing.reactions) || [],
+        reactions: mergeReactions(row.reactions, existing),
         receipts: row.receipts || (existing && existing.receipts) || [],
         state: 'sent',
       });
@@ -830,6 +830,24 @@
       // than leaving the sender on one tick permanently.
       ids.forEach((id) => deliveredSent.delete(id));
     });
+  }
+
+  /* Reactions the server can tell me about, plus the one it cannot.
+   *
+   * A reaction is sealed for each *recipient*, so nothing in it is addressed to
+   * the device that sent it — the server therefore reports my own reaction as
+   * absent, and that empty list used to overwrite the one on screen. Mine is
+   * remembered locally, exactly as the text of a message I sent is.
+   *
+   * Only *this* device's reaction is kept that way. One sent from my phone
+   * reaches my laptop through the server like anybody else's, so holding those
+   * locally too would mean a stale copy that nothing could ever clear.
+   */
+  function mergeReactions(fromServer, existing) {
+    const here = (r) => state.device && String(r.device_id) === String(state.device.id);
+    const theirs = (fromServer || []).filter((r) => !here(r));
+    const mine = (((existing && existing.reactions) || [])).filter(here);
+    return [...theirs, ...mine];
   }
 
   async function tryOpen(row) {
@@ -1176,21 +1194,19 @@
     bubble.appendChild(meta);
 
     if (message.reactions && message.reactions.length) {
-      // One pill holding every reaction, hung off the bottom edge of the bubble
-      // rather than placed inside it. In the flow it took a line of its own and
-      // grew the bubble, so reacting visibly resized the message.
+      // A pill each, hung off the bottom edge of the bubble rather than placed
+      // inside it — in the flow they took a line of their own and grew the
+      // bubble, so reacting visibly resized the message. One boundary per
+      // reactor, because a single pill around both said two people had reacted
+      // and nothing about which was which.
       const reacts = el('div', 'reacts');
-      let anyOwn = false;
       message.reactions.forEach((reaction) => {
         if (!reaction.emoji) return;
         // Yours as a person, not merely from this device.
-        if (isOwnDevice(reaction.device_id)) anyOwn = true;
-        reacts.appendChild(el('span', 'react', reaction.emoji));
+        const own = isOwnDevice(reaction.device_id);
+        reacts.appendChild(el('span', 'react' + (own ? ' own' : ''), reaction.emoji));
       });
       if (reacts.children.length) {
-        // Which of them is yours is in Details; on the pill it is only worth
-        // knowing whether you are in it.
-        if (anyOwn) reacts.classList.add('own');
         reacts.title = 'Who reacted';
         reacts.addEventListener('click', (event) => {
           event.stopPropagation();

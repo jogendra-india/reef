@@ -176,20 +176,24 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
              background:var(--surface-2);color:var(--muted);font-size:13px;
              display:flex;align-items:center;justify-content:center;}
 /* Hung off the bottom edge of the bubble rather than sitting inside it. In the
-   flow it took a line of its own and grew the message, so reacting visibly
-   resized what you were reacting to. The border matches the page rather than the
-   pill, which is what reads as a cut-out over the bubble edge. */
-.reacts{position:absolute;bottom:-12px;display:flex;align-items:center;gap:2px;
-        padding:1px 6px;border-radius:12px;background:var(--surface-2);
-        border:2px solid var(--bg);box-shadow:0 1px 4px #0006;
-        font-size:13px;line-height:1.5;cursor:pointer;white-space:nowrap;}
-/* On the outer edge of each side, where it cannot cover the tail or the ticks. */
+   flow they took a line of their own and grew the message, so reacting visibly
+   resized what you were reacting to. The rail itself is invisible — each
+   reaction carries its own boundary. */
+.reacts{position:absolute;bottom:-12px;display:flex;align-items:center;gap:3px;
+        cursor:pointer;white-space:nowrap;}
+/* One pill per person, so two reactions read as two people rather than as one
+   crowd. The border matches the page rather than the pill, which is what reads
+   as a cut-out over the bubble edge. */
+.react{padding:1px 6px;border-radius:12px;background:var(--surface-2);
+       border:2px solid var(--bg);box-shadow:0 1px 4px #0006;
+       font-size:13px;line-height:1.5;}
+/* Yours, so the same emoji from both of you is still telling you something. */
+.react.own{border-color:var(--accent);}
+/* On the outer edge of each side, where they cannot cover the tail or the ticks. */
 .row:not(.mine) .reacts{left:10px;}
 .row.mine .reacts{right:10px;}
 /* Room for the overhang, or it lands on the next message. */
 .row.reacted{margin-bottom:12px;}
-.reacts.own{border-color:var(--accent);}
-.react{font-size:13px;}
 
 .pill{position:absolute;left:50%;transform:translateX(-50%);bottom:calc(100% + 10px);
       background:var(--accent);color:var(--accent-ink);font-size:13px;font-weight:600;
