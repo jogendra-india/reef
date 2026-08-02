@@ -4547,6 +4547,15 @@
     document.addEventListener('keydown', (event) => {
       if (!$('lock').classList.contains('on')) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
+      // `#lock` stays "on" underneath a sheet — the register sheet's own PIN
+      // inputs are opened right on top of it. Without this, every digit typed
+      // into "Choose a PIN" was preventDefault()-ed here first: it never
+      // reached the input, and landed in the lock screen's dots instead —
+      // typing appeared to go to the wrong box because it was.
+      const target = document.activeElement;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+        return;
+      }
       if (/^[0-9]$/.test(event.key)) {
         event.preventDefault();
         onKey(event.key);
