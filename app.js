@@ -4319,7 +4319,41 @@
       clearInterval(approvalTimer);
       lockNow();
     });
-    $('pending-signout').addEventListener('click', signOut);
+    /* Erasing is right for "this browser is not mine any more" and wrong for
+     * "I am stuck on this screen" — and the second is much the commoner reason
+     * to be reading it. They were one unguarded tap apart, and the tap takes
+     * the keypair: the server matches this browser by its public key, so the
+     * next PIN generates a fresh one and enrols as a *new device*, pending all
+     * over again, while the room databases it just deleted took every message
+     * this device held. That is the "why did it register a new device and lose
+     * my history" report. Ask which of the two it is, and say what it costs. */
+    $('pending-signout').addEventListener('click', () => {
+      openSheet((sheet) => {
+        sheet.appendChild(el('div', 'sheet-title', 'Erase this device?'));
+        const note = el(
+          'div',
+          'sheet-title',
+          'This deletes every message stored here and this browser’s key. ' +
+            'Signing in again joins as a brand new device, which the other ' +
+            'person has to approve — and the history does not come back. ' +
+            'Only do this if you are giving the device away.'
+        );
+        note.style.color = 'var(--danger)';
+        sheet.appendChild(note);
+
+        const choice = (label, color, fn) => {
+          const button = el('button', 'act', label);
+          button.style.cssText = `justify-content:center;color:${color};font-weight:600`;
+          button.addEventListener('click', fn);
+          sheet.appendChild(button);
+        };
+        choice('Erase it', 'var(--danger)', () => {
+          closeSheet();
+          signOut();
+        });
+        choice('Keep waiting', 'var(--muted)', closeSheet);
+      });
+    });
 
     // The pad was tappable and nothing else, so on a laptop typing the PIN on
     // the number row did nothing at all.
