@@ -79,6 +79,10 @@
 
     unlock: (body) =>
       request('/unlock/', { method: 'POST', json: body, noSignOut: true }),
+    // Only path that never had a session to lose, so a wrong or taken PIN
+    // must not trip the "device revoked" handling `unlock` needs noSignOut for.
+    register: (body) =>
+      request('/register/', { method: 'POST', json: body, noSignOut: true }),
     session: () => request('/session/'),
     changePin: (body) =>
       request('/pin/', { method: 'POST', json: body, noSignOut: true }),

@@ -356,7 +356,34 @@
       if (err.status === 429) err.retryAfter = 900;
       throw err;
     }
+    await enterFromResult(result);
+  }
 
+  /* Creates a brand-new room with this browser as its only seat, then opens it
+   * exactly as unlockWith would. There is no admin and no invite code before
+   * this call — nobody else to ask — so the PIN is the one credential this app
+   * ever lets somebody choose for themselves rather than being handed. */
+  async function registerWith(pin) {
+    await ensureIdentity();
+    const body = {
+      pin,
+      device: { label: deviceLabel(), public_key_jwk: state.identity.publicJwk },
+    };
+    let result;
+    try {
+      result = await API.register(body);
+    } catch (err) {
+      if (err.status === 429) err.retryAfter = 900;
+      throw err;
+    }
+    await enterFromResult(result);
+  }
+
+  /* The tail shared by unlockWith and registerWith: both end up with the same
+   * shape — a `rooms` list, one entry per conversation this credential now
+   * opens — and everything from here on (which one to show, marking the
+   * device unlocked) has nothing to do with how it was obtained. */
+  async function enterFromResult(result) {
     // Checked before anything is stored. An empty list used to fall through to
     // `preferred.room_id` on undefined, and the resulting TypeError was caught
     // by submitPin — so a correct PIN reported itself as wrong.
@@ -3352,6 +3379,69 @@
     }, { locked: forced });
   }
 
+  /* The one place this app lets somebody choose a credential rather than being
+   * handed one. Every other seat exists because an admin or an already-seated
+   * person made it; the very first person on a fresh deployment has neither,
+   * so this is that missing step — a new, empty room with this browser as its
+   * only seat. Reached from a link on the lock screen rather than the keypad,
+   * since a keypad with nothing behind it yet is not something to guess at. */
+  function openRegisterSheet() {
+    let busy = false;
+    openSheet((sheet) => {
+      sheet.appendChild(
+        el(
+          'div',
+          'sheet-title',
+          'Choose a PIN and this becomes your own conversation, ready for you ' +
+            'to invite the person you want to talk to. Nobody else needs to ' +
+            'do anything first.'
+        )
+      );
+      const pin = el('input');
+      const confirm = el('input');
+      [pin, confirm].forEach((input, i) => {
+        input.type = 'tel';
+        input.inputMode = 'numeric';
+        input.maxLength = PIN_LENGTH;
+        input.placeholder = i ? 'Confirm PIN' : 'Choose a PIN';
+        input.style.cssText =
+          'width:100%;padding:12px;border-radius:12px;background:var(--bg);border:1px solid var(--line);margin-bottom:8px;letter-spacing:.5em;text-align:center';
+        sheet.appendChild(input);
+      });
+      const error = el('div', 'sheet-title');
+      error.style.color = 'var(--danger)';
+      sheet.appendChild(error);
+
+      const create = el('button', 'act', 'Create account');
+      create.style.justifyContent = 'center';
+      create.addEventListener('click', async () => {
+        if (busy) return;
+        if (pin.value !== confirm.value) {
+          error.textContent = 'Those two do not match.';
+          return;
+        }
+        busy = true;
+        error.textContent = '';
+        create.textContent = 'Creating…';
+        try {
+          await registerWith(pin.value);
+          closeSheet();
+          toast('Account created. Invite someone from the menu when ready.');
+        } catch (err) {
+          error.textContent =
+            (err.data && err.data.pin && err.data.pin[0]) ||
+            (err.data && err.data.device && String(err.data.device[0] || err.data.device)) ||
+            (err.offline && 'No connection') ||
+            'Could not create that — try again';
+        } finally {
+          busy = false;
+          create.textContent = 'Create account';
+        }
+      });
+      sheet.appendChild(create);
+    });
+  }
+
   /* ==================================================================== *
    * Message actions
    * ==================================================================== */
@@ -4400,6 +4490,7 @@
       }
       if (event.target.id === 'viewer') $('viewer').classList.remove('on');
     });
+    $('lock-register').addEventListener('click', openRegisterSheet);
     // Re-runs unlock with the *same* device id, so the server can reconsider a
     // pending device — which it does while the conversation is still empty and
     // nobody exists yet to approve anyone. Deliberately does not clear
