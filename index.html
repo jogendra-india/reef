@@ -32,6 +32,11 @@ body{
   overscroll-behavior:none;
 }
 button,input,textarea{font:inherit;color:inherit;}
+/* The PIN boxes space out digits with letter-spacing, and a placeholder is
+   part of the same text run — "Choose a PIN" spaced out that wide overflowed
+   a box sized for six characters. Placeholder text was never the thing the
+   spacing was for. */
+input::placeholder{letter-spacing:normal;}
 button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .tap{min-width:48px;min-height:48px;display:flex;align-items:center;justify-content:center;}
 
