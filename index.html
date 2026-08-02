@@ -386,7 +386,12 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
     <h2>Waiting to be let in</h2>
     <p id="pending-note">The other person needs to approve this device before anything appears here.</p>
     <button class="act" id="pending-retry" style="justify-content:center;color:var(--accent)">Enter my PIN again</button>
-    <button class="act" id="pending-signout" style="justify-content:center;color:var(--muted)">Start over on this device</button>
+    <!-- Deliberately not .act: that class made this read as the same size,
+         width and weight as the safe retry button above it — a full-width
+         card sitting right where a thumb reaching for retry would land. A
+         kill switch that erases the device and its history unrecoverably
+         should look smaller than the button next to it, not equal to it. -->
+    <button id="pending-signout" style="color:var(--muted);font-size:13px;padding:10px 12px">Start over on this device</button>
   </section>
 
   <section id="pool" class="screen">
