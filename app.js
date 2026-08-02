@@ -815,7 +815,15 @@
 
   async function ingest(rows, prepend) {
     const decoded = [];
+    // Counted here rather than only on the live socket event, because the
+    // live event was the only path that ever counted anything. A message
+    // that arrived while the socket was reconnecting — which is routine,
+    // not rare — came in through here instead, on the same reconnect that
+    // calls syncHistory, and landed silently: rendered, but with no pill and
+    // no clue that anything had changed, if the reader was scrolled up.
+    let freshUnseen = 0;
     for (const row of rows) {
+      const isNewToThisDevice = !state.messages.has(row.id);
       let existing = state.messages.get(row.id);
       if (!existing) {
         // Not in memory is not the same as not on this device. hydrateFromLocal
@@ -863,6 +871,12 @@
       if (!merged.body && !merged.deleted) merged.body = { undecryptable: true };
       if (merged.deleted) merged.body = null;
       decoded.push(merged);
+      // Not on a history page load — those are pages the reader asked for by
+      // scrolling, the opposite of something they missed — and not the
+      // reader's own message, and not a profile change dressed as a message.
+      if (!prepend && isNewToThisDevice && !row.mine && !isSystem(merged)) {
+        freshUnseen++;
+      }
     }
     decoded.forEach((m) => {
       applyProfileMessage(m);
@@ -890,6 +904,14 @@
     renderList(prepend);
     markVisibleRead();
     confirmDelivery(decoded);
+    // Guarded on stickBottom exactly as the pill itself is: a cold start with
+    // a whole history to load is "new to this device" for every row in it,
+    // and stickBottom still being true at that point (nobody has scrolled
+    // anywhere yet) is what keeps that from reading as hundreds of ripples.
+    if (freshUnseen && !state.stickBottom) {
+      state.unseen += freshUnseen;
+      paintPill();
+    }
   }
 
   // Ids this device has already told the server about, so a re-read of the tail
@@ -3713,14 +3735,14 @@
       // used to acknowledge nothing.
       case 'msg.new': {
         await ingest([event.message]);
-        // A profile announcement is not a ripple. Counting one meant changing
-        // your fish told the other person they had a new message.
+        // The unseen count and the pill are ingest's job now, shared with
+        // syncHistory's own catch-up — this stays for the one thing that is
+        // still specific to a live arrival: a haptic buzz regardless of
+        // scroll position. A profile announcement is not a ripple, so it gets
+        // neither; changing your fish used to tell the other person they had
+        // a new message.
         const arrived = state.messages.get(event.message.id);
         if (!event.message.mine && !(arrived && isSystem(arrived))) {
-          if (!state.stickBottom) {
-            state.unseen += 1;
-            paintPill();
-          }
           buzz(12);
         }
         break;
@@ -4425,7 +4447,15 @@
     const previous = $('list').querySelector('.bubble.found');
     if (previous) previous.classList.remove('found');
 
-    let row = revealMessage(id);
+    // Already on screen — or at least already rendered — needs nothing
+    // revealed. revealMessage recentres a 200-row window on the target
+    // regardless of whether the current one already holds it, which is why
+    // replying to a message one screen up scrolled as far as one from March:
+    // the window underneath it was rebuilt into an unrelated position before
+    // scrollIntoView ever ran, so the "short hop" it then made was short
+    // relative to that new position, not to where the reader actually was.
+    let row = [...$('list').children].find((n) => n.dataset && n.dataset.id === id);
+    if (!row) row = revealMessage(id);
     if (!row) {
       // Not in memory, which is not the same as not here: the thread holds only
       // the most recent few hundred, and a reply can point at something far
