@@ -169,6 +169,14 @@
   // guessing; six turns the same attack into decades.
   const PIN_LENGTH = 6;
 
+  // A box sized for six digits, not for the sheet it sits in. `width:100%`
+  // read as generous on a phone and absurd once the sheet itself was capped
+  // on a wide screen — a PIN entry stretched nearly as wide as the dialog.
+  const PIN_INPUT_STYLE =
+    'width:11em;max-width:100%;display:block;margin:0 auto 8px;padding:12px;' +
+    'border-radius:12px;background:var(--bg);border:1px solid var(--line);' +
+    'letter-spacing:.5em;text-align:center';
+
   let entry = '';
   let lockBusy = false;
 
@@ -3329,8 +3337,7 @@
         input.inputMode = 'numeric';
         input.maxLength = PIN_LENGTH;
         input.placeholder = i ? 'New PIN' : 'Current PIN';
-        input.style.cssText =
-          'width:100%;padding:12px;border-radius:12px;background:var(--bg);border:1px solid var(--line);margin-bottom:8px;letter-spacing:.5em;text-align:center';
+        input.style.cssText = PIN_INPUT_STYLE;
         sheet.appendChild(input);
       });
       if (forced) current.placeholder = 'The PIN you were sent';
@@ -3404,8 +3411,7 @@
         input.inputMode = 'numeric';
         input.maxLength = PIN_LENGTH;
         input.placeholder = i ? 'Confirm PIN' : 'Choose a PIN';
-        input.style.cssText =
-          'width:100%;padding:12px;border-radius:12px;background:var(--bg);border:1px solid var(--line);margin-bottom:8px;letter-spacing:.5em;text-align:center';
+        input.style.cssText = PIN_INPUT_STYLE;
         sheet.appendChild(input);
       });
       const error = el('div', 'sheet-title');

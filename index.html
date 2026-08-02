@@ -346,6 +346,13 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
   .banner{padding-left:calc(50vw - 410px);padding-right:calc(50vw - 410px);}
   /* A share of the column, not of the monitor. */
   .bubble{max-width:min(78%,560px);}
+  /* #sheet was left0/right0 for a phone's edge-to-edge bottom sheet, which on
+     a wide screen stretched every dialog it hosts — the PIN pad, the device
+     list — clear across the monitor. Capped and centered, still rising from
+     the bottom. */
+  #sheet{left:50%;right:auto;width:min(480px,92vw);
+         transform:translate(-50%,102%);border-radius:22px;}
+  #sheet.on{transform:translate(-50%,0);}
 }
 </style>
 </head>
