@@ -116,6 +116,13 @@
     pendingDevices: [],
     // Mirrors the stored setting so the menu can label the bell without an await.
     notifications: true,
+    // Whether the browser has promised not to evict this origin. The keypair
+    // lives in IndexedDB and cannot be re-created, so this is the difference
+    // between being signed out and becoming a different device.
+    storagePersisted: null,
+    // Set when this load had to generate a keypair, which means the vault was
+    // empty: a wipe, or an eviction.
+    freshIdentity: false,
     build: null,
     hiddenAt: null,
     locked: true,
@@ -271,7 +278,38 @@
    * Identity and unlock
    * ==================================================================== */
 
+  /* Asks the browser not to throw this origin away.
+   *
+   * Without a persistence grant, IndexedDB is best-effort storage: Chrome on
+   * Android evicts it under pressure, and the system's own "free up space"
+   * flows take it too. What lives in there is the keypair, and the private
+   * half is deliberately non-extractable — there is no copy and no way to make
+   * one — so losing the vault does not sign this device out, it makes the
+   * browser a *stranger*. The next PIN generates a new key, the server matches
+   * browsers by public key and sees one it has never met, and what should have
+   * been "signing in again" enrols a new device with a new id and no history.
+   *
+   * Chrome grants this to an installed PWA or a site with enough engagement,
+   * and it is a no-op once granted. Nothing depends on the answer, so a refusal
+   * is recorded for the storage sheet rather than acted on.
+   */
+  async function keepStorage() {
+    try {
+      if (!navigator.storage || !navigator.storage.persist) return null;
+      const already = navigator.storage.persisted
+        ? await navigator.storage.persisted()
+        : false;
+      state.storagePersisted = already || (await navigator.storage.persist());
+      return state.storagePersisted;
+    } catch (e) {
+      return null; // not offered here; the vault is as safe as the browser makes it
+    }
+  }
+
   async function ensureIdentity() {
+    // Before the read, not after: asking once the key is already gone is too
+    // late to be the thing that kept it.
+    await keepStorage();
     let identity = await DB.identity();
     if (!identity) {
       const pair = await C.generateIdentity();
@@ -283,6 +321,11 @@
       // keeps it that way, so it survives a restart without ever being
       // exportable by script.
       await DB.setIdentity(identity);
+      // Worth saying out loud on the waiting screen. A browser with no stored
+      // key is not this device signing in again — it is a new one, which is
+      // why approval is being asked for and why the thread will not come back
+      // with it. Silently, this looked like the app losing messages.
+      state.freshIdentity = true;
     }
     state.identity = identity;
     return identity;
@@ -428,11 +471,28 @@
   async function afterUnlock() {
     // A join PIN was sent over someone else's messenger and is probably still
     // sitting in that thread. Nothing else happens until it is replaced.
-    if (state.mustChangePin) {
+    //
+    // Read from the session as well as from the unlock, and that is the whole
+    // bug: `state.mustChangePin` was set in unlockWith and nowhere else, so it
+    // was undefined on every load that resumed a stored session. A seat that
+    // stayed signed in was therefore never once asked, and could sit on its
+    // one-time join PIN indefinitely — right up to the day it expired and
+    // stopped opening the conversation at all.
+    const session = state.session || {};
+    if (state.mustChangePin || session.must_change_pin) {
       showScreen('pool');
-      return openPinSheet({ forced: true });
+      return openPinSheet({
+        forced: true,
+        expiresAt: session.join_pin_expires_at || null,
+      });
     }
     if (state.device.status !== 'active') {
+      $('pending-note').textContent = state.freshIdentity
+        ? 'This browser had no saved key, so it is joining as a new device — ' +
+          'not the one you signed in on before. The other person has to let it ' +
+          'in, and the messages that were on it do not come back with it.'
+        : 'The other person needs to approve this device before anything ' +
+          'appears here.';
       showScreen('pending');
       pollForApproval();
       return;
@@ -2598,6 +2658,15 @@
       if (quota && quota.usage) {
         line('This site altogether', fileSize(quota.usage));
       }
+      // The one number here that is not about space. Unpersisted, the browser
+      // may evict this origin, and evicting it takes the keypair — which reads
+      // as the app losing every message and asking to be approved again.
+      if (state.storagePersisted !== null) {
+        line(
+          'Protected from cleanup',
+          state.storagePersisted ? 'Yes' : 'No — install the app'
+        );
+      }
 
       sheet.appendChild(
         el(
@@ -3238,6 +3307,27 @@
         sheet.appendChild(input);
       });
       if (forced) current.placeholder = 'The PIN you were sent';
+      // A join PIN has a shelf life, and running out of it is not a soft
+      // failure: `resolve_by_pin` skips an expired one, so the PIN pad simply
+      // says "wrong PIN" forever after. Say the date while it can still be
+      // acted on.
+      if (forced && options.expiresAt) {
+        const gone = Date.parse(options.expiresAt) < Date.now();
+        const warn = el(
+          'div',
+          'sheet-title',
+          gone
+            ? 'That one-time PIN has already expired — it will not open this ' +
+              'conversation again. This device is still signed in, so setting ' +
+              'a new PIN here is the way back. Do it before signing out.'
+            : 'It stops working ' +
+              stamp(options.expiresAt) +
+              '. After that it opens nothing, and a device already signed in ' +
+              'is the only way back into this seat.'
+        );
+        warn.style.color = 'var(--danger)';
+        sheet.appendChild(warn);
+      }
       const save = el('button', 'act', forced ? 'Set my PIN' : 'Change PIN');
       save.style.justifyContent = 'center';
       save.addEventListener('click', async () => {
@@ -4433,6 +4523,36 @@
     watchIdle();
 
     if ('serviceWorker' in navigator) {
+      /* Take the new shell as soon as there is one.
+       *
+       * The worker already calls skipWaiting and clients.claim, so a new build
+       * installs and takes over straight away — but that decides who answers
+       * the *next* request, not what the page is currently running. An app
+       * left open, or reopened from the launcher without a hard refresh, went
+       * on running the shell it parsed however many builds ago, and every fix
+       * sat there unused until somebody thought to pull down. Which is not a
+       * thing to ask of the person the fix is for.
+       *
+       * Guarded on there having been a controller already: the first
+       * registration on a fresh install fires this too, and reloading a page
+       * that has only just started is a loop. */
+      const hadController = !!navigator.serviceWorker.controller;
+      let takingOver = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (!hadController || takingOver) return;
+        takingOver = true;
+        location.reload();
+      });
+      // An open tab never asks again on its own, so a phone that lives in the
+      // app switcher for a week would never see any of this. Coming back to
+      // the foreground is the natural moment to check.
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') return;
+        navigator.serviceWorker
+          .getRegistration()
+          .then((reg) => reg && reg.update())
+          .catch(() => {});
+      });
       navigator.serviceWorker.register('./sw.js').catch(() => {});
       // Neither of the worker's two messages had anyone listening. Background
       // sync posted flush-outbox into the void, and the build stamp it answers
