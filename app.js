@@ -3372,6 +3372,12 @@
             // The old PIN is dead now, so the tokens issued under it are
             // re-fetched by signing in again with the new one.
             state.mustChangePin = false;
+            // Reached from the lock screen, where "sign in again" means the
+            // pad still has nothing to open — this device already proved who
+            // it is via the token that authenticated the change itself, so
+            // finish the job rather than hand them a keypad and ask for the
+            // PIN they just chose.
+            if (options.onChanged) return options.onChanged(next.value);
             toast('Done. Sign in with your new PIN.');
             return lockNow();
           }
@@ -3997,6 +4003,55 @@
     location.reload();
   }
 
+  /* Whether the PIN this device is locked behind can still open anything.
+   *
+   * A join PIN is checked once, at the exact moment it is typed into
+   * `/unlock/` — nowhere else, on purpose, so a stranger probing PINs never
+   * learns "that one exists but expired" versus "wrong". But this device
+   * already proved who it is before it locked: it is still holding a live,
+   * unrevoked token. For *that* token, telling it its own PIN has gone stale
+   * leaks nothing to anybody else — it is telling a session about itself.
+   *
+   * Without this, the only way back once the PIN died was locking the phone
+   * at all: the pad always re-derives through `/unlock/`, so a stored session
+   * that was never signed out still hit the same dead end retyping the exact
+   * PIN it unlocked with five minutes earlier. The fix that lets a PIN be
+   * changed after it expires is worth nothing if nobody is ever told to use
+   * it before they need it.
+   */
+  async function offerPinResetFromLock() {
+    let sessions;
+    try {
+      sessions = await DB.sessions();
+    } catch (e) {
+      return;
+    }
+    for (const roomId of Object.keys(sessions)) {
+      const session = sessions[roomId];
+      if (!session || !session.token) continue;
+      API.setToken(session.token);
+      let result;
+      try {
+        result = await API.session();
+      } catch (e) {
+        continue; // offline, or this room's token no longer works — try the next
+      }
+      const info = result && result.session;
+      if (!info || !info.must_change_pin) continue;
+      // Found one. A PIN is per-identity, not per-room, so fixing it through
+      // whichever room noticed is enough — every room this identity holds
+      // comes back the moment `unlockWith` runs on the new PIN.
+      $('lock-note').textContent =
+        'This device is signed in, but the one-time PIN it was set up with ' +
+        'needs replacing before it can unlock again.';
+      return openPinSheet({
+        forced: true,
+        expiresAt: info.join_pin_expires_at,
+        onChanged: (newPin) => unlockWith(newPin),
+      });
+    }
+  }
+
   async function lockNow() {
     state.locked = true;
     idleStop();
@@ -4016,6 +4071,7 @@
     paintDots();
     $('lock-note').textContent = '';
     showScreen('lock');
+    offerPinResetFromLock();
   }
 
   /* Locks a conversation left open and untouched.
@@ -4764,6 +4820,7 @@
     }
     showScreen('lock');
     explainSignOut();
+    offerPinResetFromLock();
   }
 
   /* Carried across the reload that a revoked device triggers, so the lock screen
