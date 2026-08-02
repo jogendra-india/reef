@@ -3407,13 +3407,34 @@
       const pin = el('input');
       const confirm = el('input');
       [pin, confirm].forEach((input, i) => {
-        input.type = 'tel';
+        // Masked, like the credential it is choosing — this is the one PIN
+        // sheet where somebody is composing a brand-new secret rather than
+        // typing back one they already know, so getting a look at it before
+        // committing is worth a tap rather than a given.
+        input.type = 'password';
+        input.autocomplete = 'off';
         input.inputMode = 'numeric';
         input.maxLength = PIN_LENGTH;
         input.placeholder = i ? 'Confirm PIN' : 'Choose a PIN';
         input.style.cssText = PIN_INPUT_STYLE;
         sheet.appendChild(input);
       });
+
+      const revealRow = el('div');
+      revealRow.style.cssText = 'text-align:center;margin:-4px 0 10px';
+      const reveal = el('button', null, 'Show');
+      reveal.style.cssText = 'color:var(--accent);font-weight:600;padding:6px 10px';
+      let revealed = false;
+      reveal.addEventListener('click', () => {
+        revealed = !revealed;
+        // Toggling `type`, not `inputMode` — the numeric keypad on a phone has
+        // nothing to do with whether the digits typed into it are masked.
+        pin.type = confirm.type = revealed ? 'text' : 'password';
+        reveal.textContent = revealed ? 'Hide' : 'Show';
+      });
+      revealRow.appendChild(reveal);
+      sheet.appendChild(revealRow);
+
       const error = el('div', 'sheet-title');
       error.style.color = 'var(--danger)';
       sheet.appendChild(error);
