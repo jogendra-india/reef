@@ -463,6 +463,20 @@
     clearInterval(devicesTimer);
     clearInterval(presenceTimer);
     state.messages = new Map();
+    // The DOM, not only the state. Clearing state.messages here meant the
+    // *next* renderList() would draw the right room — but showScreen('pool')
+    // below runs long before that, and reveals whatever #list already
+    // contained. On a browser signed into two seats, "whatever it already
+    // contained" was the other seat's conversation: real bubbles, briefly on
+    // screen, replaced only once refreshKeys/hydrateFromLocal finally
+    // finished their round trips. Same reasoning for the header text, which
+    // no code here repaints until refreshKeys does, several awaits later —
+    // the other person's name showing for that window is the same leak in a
+    // smaller box.
+    $('list').innerHTML = '';
+    $('peer-name').textContent = 'Reef';
+    $('peer-avatar').textContent = '🐟';
+    $('peer-state').textContent = '';
     state.profiles = {};
     state.recipients = [];
     state.pairKeys = {};
