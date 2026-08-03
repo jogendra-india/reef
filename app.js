@@ -1215,7 +1215,9 @@
   };
 
   const ordered = () => {
-    if (!orderCache) orderCache = chronological().filter((m) => !isSystem(m));
+    if (!orderCache) {
+      orderCache = chronological().filter((m) => !isSystem(m) && !m.hiddenForMe);
+    }
     return orderCache;
   };
 
@@ -2654,13 +2656,20 @@
   }
 
   async function bulkHideForMe() {
+    // Flagged and kept, not deleted — see hideLocally for why: a row removed
+    // outright comes back on the next history sync, since the server was
+    // never told and hands it over again.
+    const changed = [];
     for (const id of state.selection) {
-      state.messages.delete(id);
-      await DB.del(DB.STORES.messages, id);
+      const message = state.messages.get(id);
+      if (!message) continue;
+      message.hiddenForMe = true;
+      changed.push(message);
     }
+    if (changed.length) await DB.putMessages(changed);
     invalidateOrder();
-    // Ends the mode rather than only re-rendering: with the messages gone,
-    // there is nothing left selected to act on again.
+    // Ends the mode rather than only re-rendering: with the messages gone
+    // from view, there is nothing left selected to act on again.
     exitSelectMode();
   }
 
@@ -3732,9 +3741,18 @@
   async function hideLocally(message) {
     // Never reaches the server. "Delete for me" that quietly deleted the other
     // person's copy would be a lie.
-    state.messages.delete(message.id);
+    //
+    // A flag kept on the row, not a row removed from the store. Deleting it
+    // outright looked hidden right up until the next syncHistory — the
+    // history endpoint has no idea this device ever hid anything, so it
+    // handed the same message straight back, and ingest, finding no
+    // `existing` copy to tell it otherwise, treated it as new and put it
+    // back. The flag survives that: ingest's merge starts from whatever is
+    // already on file and only overwrites the fields it explicitly names,
+    // so hiddenForMe rides along through every future re-fetch.
+    message.hiddenForMe = true;
+    await DB.putMessages([message]);
     invalidateOrder();
-    await DB.del(DB.STORES.messages, message.id);
     renderList();
   }
 
