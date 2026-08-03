@@ -2550,7 +2550,7 @@
         if (message.mine && withinEditWindow(message)) {
           action('✎', 'Edit', () => startEdit(message));
         }
-        if (message.mine) {
+        if (message.mine && withinDeleteWindow(message)) {
           action('🗑', 'Delete for everyone', () => removeMessage(message), true);
         }
       }
@@ -2634,6 +2634,14 @@
 
   function withinEditWindow(message) {
     return Date.now() - new Date(message.createdAt).getTime() < 5 * 60 * 1000;
+  }
+
+  // Mirrors the server's DELETE_EVERYONE_WINDOW. Checked here too so the
+  // option is not even offered on something the server would refuse — the
+  // alternative is a menu item that looks available and answers with an
+  // error every time, past two days, forever.
+  function withinDeleteWindow(message) {
+    return Date.now() - new Date(message.createdAt).getTime() < 2 * 24 * 60 * 60 * 1000;
   }
 
   function openMenuSheet() {
@@ -3587,7 +3595,11 @@
       await DB.putMessages([message]);
       refreshRow(message);
     } catch (e) {
-      toast('Could not delete');
+      // The client-side window check above is what usually stops this from
+      // being reached at all, but it reads a local clock and the server's
+      // is what actually decides — so its own reason, when it gives one,
+      // is worth showing rather than papering over with a generic failure.
+      toast((e.data && e.data.detail) || 'Could not delete');
     }
   }
 
