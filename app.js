@@ -112,6 +112,11 @@
     lastSeen: null,
     stickBottom: true,
     unseen: 0,
+    // Multi-select. A Set rather than a count: toggling has to know which
+    // messages, not just how many, and the bulk bar's own eligibility check
+    // reads every one of them.
+    selecting: false,
+    selection: new Set(),
     devices: [],
     pendingDevices: [],
     // Mirrors the stored setting so the menu can label the bell without an await.
@@ -477,6 +482,12 @@
     $('peer-name').textContent = 'Reef';
     $('peer-avatar').textContent = '🐟';
     $('peer-state').textContent = '';
+    // A selection is a set of ids in *this* room; carrying it into another
+    // one is at best meaningless and at worst a bulk action landing on
+    // whichever unrelated messages happen to share those ids.
+    state.selecting = false;
+    state.selection = new Set();
+    updateSelectBar();
     state.profiles = {};
     state.recipients = [];
     state.pairKeys = {};
@@ -1416,7 +1427,25 @@
       bubble.addEventListener('click', () => retrySend(message));
     }
     attachGestures(row, bubble, message);
-    row.appendChild(bubble);
+    if (state.selecting) {
+      // DOM order, not CSS, puts this on the outer edge either way: a
+      // .mine row is justify-content:flex-end, so a box appended *after*
+      // the bubble packs to its right — the wall side. A peer row is
+      // flex-start, so a box inserted *before* packs to its left — the
+      // same wall side from the other end. Getting this from layout order
+      // means it never has to know which side is "outer" itself.
+      const box = el('span', 'checkbox');
+      if (state.selection.has(message.id)) box.classList.add('checked');
+      if (message.mine) {
+        row.appendChild(bubble);
+        row.appendChild(box);
+      } else {
+        row.appendChild(box);
+        row.appendChild(bubble);
+      }
+    } else {
+      row.appendChild(bubble);
+    }
     return row;
   }
 
@@ -2365,9 +2394,17 @@
       holdTimer = null;
     };
 
+    // While selecting, a tap toggles this row and nothing else — the long
+    // press and the reply swipe both belong to the single-message sheet,
+    // which selection mode is a replacement for, not a companion to.
+    row.addEventListener('click', () => {
+      if (state.selecting) toggleSelect(message.id);
+    });
+
     row.addEventListener(
       'pointerdown',
       (event) => {
+        if (state.selecting) return;
         // A right-click is the context menu, not the start of a swipe.
         if (event.pointerType === 'mouse' && event.button !== 0) return;
         holding = event.pointerId;
@@ -2433,6 +2470,7 @@
       // behind a 480ms press-and-hold, which is a phone gesture nobody performs
       // with a mouse. Right-click now opens the same sheet a long press does.
       event.preventDefault();
+      if (state.selecting) return toggleSelect(message.id);
       cancelHold();
       if (opened) return;
       opened = true;
@@ -2556,7 +2594,95 @@
       }
       action('ℹ', 'Details', () => openInfoSheet(message));
       action('👁', 'Hide for me', () => hideLocally(message));
+      action('☑', 'Select', () => enterSelectMode(message));
     });
+  }
+
+  /* ==================================================================== *
+   * Multi-select
+   * ==================================================================== */
+
+  function enterSelectMode(message) {
+    state.selecting = true;
+    state.selection = new Set([message.id]);
+    renderList();
+    updateSelectBar();
+  }
+
+  function exitSelectMode() {
+    state.selecting = false;
+    state.selection = new Set();
+    renderList();
+    updateSelectBar();
+  }
+
+  function toggleSelect(id) {
+    if (state.selection.has(id)) state.selection.delete(id);
+    else state.selection.add(id);
+    // Deselecting the last one is the same as cancelling — there is nothing
+    // left to act on, and a bar offering actions for zero messages is a bar
+    // with nothing honest to say.
+    if (!state.selection.size) return exitSelectMode();
+    refreshRow(state.messages.get(id));
+    updateSelectBar();
+  }
+
+  /* What the bar shows: how many, and which actions still make sense for
+   * every one of them. "Hide for me" always does — it is unconditional even
+   * one at a time. "Delete for everyone" is offered only when every single
+   * selected message would individually qualify for it; two eligible messages
+   * mixed in with three that are not is not a partial delete, it is a
+   * confusing one, so the bar does not offer it at all rather than doing three
+   * of the five and reporting back which. */
+  function updateSelectBar() {
+    const bar = $('select-bar');
+    $('inputrow').style.display = state.selecting ? 'none' : 'flex';
+    if (!state.selecting) {
+      bar.style.display = 'none';
+      return;
+    }
+    bar.style.display = 'flex';
+    const n = state.selection.size;
+    $('select-count').textContent = `${n} selected`;
+    const selected = [...state.selection]
+      .map((id) => state.messages.get(id))
+      .filter(Boolean);
+    const canDeleteAll =
+      selected.length > 0 &&
+      selected.every((m) => m.mine && !m.deleted && withinDeleteWindow(m));
+    $('select-delete').style.display = canDeleteAll ? '' : 'none';
+  }
+
+  async function bulkHideForMe() {
+    for (const id of state.selection) {
+      state.messages.delete(id);
+      await DB.del(DB.STORES.messages, id);
+    }
+    invalidateOrder();
+    // Ends the mode rather than only re-rendering: with the messages gone,
+    // there is nothing left selected to act on again.
+    exitSelectMode();
+  }
+
+  async function bulkDeleteForEveryone() {
+    const changed = [];
+    for (const id of state.selection) {
+      const message = state.messages.get(id);
+      if (!message) continue;
+      try {
+        await API.remove(id);
+        message.deleted = true;
+        message.body = null;
+        changed.push(message);
+      } catch (e) {
+        // One failing — the window closing mid-selection, a dropped
+        // connection — must not silently swallow the rest; it also must not
+        // abort them, since whichever already succeeded should stay deleted.
+        toast((e.data && e.data.detail) || 'Could not delete one of them');
+      }
+    }
+    if (changed.length) await DB.putMessages(changed);
+    exitSelectMode();
   }
 
   const stamp = (iso) =>
@@ -4594,6 +4720,9 @@
     });
     $('reply-cancel').addEventListener('click', clearReply);
     $('edit-cancel').addEventListener('click', cancelEdit);
+    $('select-cancel').addEventListener('click', exitSelectMode);
+    $('select-hide').addEventListener('click', bulkHideForMe);
+    $('select-delete').addEventListener('click', bulkDeleteForEveryone);
 
     $('search-btn').addEventListener('click', openSearch);
     $('search-close').addEventListener('click', closeSearch);

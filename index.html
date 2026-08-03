@@ -113,6 +113,11 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .row{display:flex;width:100%;touch-action:pan-y;}
 .row.mine{justify-content:flex-end;}
 .row.gap{margin-top:8px;}
+.checkbox{width:22px;height:22px;border-radius:50%;flex:0 0 auto;align-self:center;
+          margin:0 8px;border:2px solid var(--line);background:var(--surface);}
+.checkbox.checked{background:var(--accent);border-color:var(--accent);
+                   display:flex;align-items:center;justify-content:center;}
+.checkbox.checked::after{content:'✓';color:var(--accent-ink);font-size:13px;font-weight:700;}
 
 .bubble{
   position:relative;max-width:78%;padding:8px 11px 6px;border-radius:var(--radius);
@@ -441,7 +446,17 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
            nothing until it went. -->
       <div id="staged"></div>
 
-      <div class="inputrow">
+      <!-- Replaces the input row while selecting, rather than sitting above it —
+           composing a new message and picking old ones to erase read as two
+           different modes, not two things to do at once. -->
+      <div id="select-bar" style="display:none;align-items:center;gap:6px;padding:6px 4px">
+        <button class="tap" id="select-cancel" aria-label="Cancel selection">✕</button>
+        <span class="grow" id="select-count">0 selected</span>
+        <button id="select-hide" style="color:var(--muted);font-weight:600;padding:8px 10px">Hide for me</button>
+        <button id="select-delete" style="color:var(--danger);font-weight:600;padding:8px 10px">Delete for everyone</button>
+      </div>
+
+      <div class="inputrow" id="inputrow">
         <button class="tap" id="attach" aria-label="Attach">＋</button>
         <textarea id="text" rows="1" placeholder="Say something…"
                   enterkeyhint="send" autocomplete="off" autocorrect="on"></textarea>
