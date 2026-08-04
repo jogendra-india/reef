@@ -139,11 +139,40 @@ export class ReefAgent {
     return writeFile(this.statePath, JSON.stringify(this.state, null, 2));
   }
 
+  /* `/unlock/` reissues this device's token every time it is called — it has
+   * to, since the same public key is how it recognises "the same browser
+   * coming back" rather than a new device. That is fine for one browser tab,
+   * but here it means a second short-lived call (a `send` while `listen` is
+   * still running) silently logs the first one out from under it: same state
+   * file, same device, same PIN, but a fresh token that invalidates whichever
+   * one was issued last. So the token is cached and reused across separate
+   * process invocations, and `/unlock/` is only called again when there is
+   * no cached session or the cached one turns out to be stale. */
+  async connect() {
+    const cached = this.state.session;
+    if (cached && cached.pin === this.pin) {
+      this.token = cached.token;
+      this.roomId = cached.roomId;
+      this.deviceId = cached.deviceId;
+      this.status = 'active';
+      try {
+        await this.refreshKeys();
+        return this;
+      } catch (e) {
+        // Anything other than "this token is no good any more" is a real
+        // outage (offline, server down) — re-unlocking would not fix that
+        // and would just mask it as something else.
+        if (e.status !== 401) throw e;
+      }
+    }
+    return this._unlockFresh();
+  }
+
   /* One PIN opens every room its holder is seated in, and a device is enrolled
    * per room. Picks the room that has somebody in it, which is what the browser
    * client does and for the same reason: a seeded-but-empty room otherwise wins
    * on being older. */
-  async connect() {
+  async _unlockFresh() {
     const result = await request('/unlock/', {
       method: 'POST',
       json: { pin: this.pin, device: { label: this.label, public_key_jwk: this.state.identity.publicJwk } },
@@ -170,6 +199,10 @@ export class ReefAgent {
       throw new Error('This device is waiting to be approved by the other side.');
     }
     await this.refreshKeys();
+    this.state.session = {
+      pin: this.pin, token: this.token, roomId: this.roomId, deviceId: this.deviceId,
+    };
+    await this.save();
     return this;
   }
 
@@ -330,8 +363,18 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       // Replace with whatever the agent should actually do.
       await self.send(`heard: ${message.text}`);
     });
+  } else if (command === 'listen') {
+    // Same polling loop as `watch`, but never replies on its own — this is
+    // the half meant to sit behind Monitor: one clean stdout line per real
+    // incoming message, and nothing else, so the decision to wake an LLM
+    // turn is "did a line print", not a schedule. Replying is a separate,
+    // deliberate `send` call from whoever reads that line.
+    console.log(`listening on room ${agent.roomId}`);
+    await agent.watch(async (message) => {
+      console.log(`REEF_MSG ${JSON.stringify({ id: message.id, from: message.from, at: message.at, text: message.text })}`);
+    });
   } else {
-    console.error('Commands: whoami | send <text> | read | watch');
+    console.error('Commands: whoami | send <text> | read | watch | listen');
     process.exit(2);
   }
 }
