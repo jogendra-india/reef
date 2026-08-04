@@ -19,12 +19,43 @@
  *   node reef-agent.mjs --pin 481357 --state ./alice.json send "hello"
  *   node reef-agent.mjs --pin 481357 --state ./alice.json read
  *   node reef-agent.mjs --pin 481357 --state ./alice.json watch
+ *
+ * `--pin` sits in shell history and `ps aux` for anyone else on the machine
+ * to read. Put `REEF_PIN=481357` in `agent/.env` instead (see .env.example)
+ * and drop `--pin` entirely — it's picked up automatically.
  */
 
 import { webcrypto as crypto } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+
+/* A PIN typed after --pin sits in shell history and in `ps aux` for anyone
+ * else on the machine to read. `agent/.env` (gitignored, never committed) is
+ * the alternative: `REEF_PIN=333023` there is picked up automatically,
+ * nothing to pass on the command line at all. Real environment variables
+ * still win over the file, same as every other dotenv convention — this is
+ * only a floor, not an override. Co-located with the script, not the cwd, so
+ * it's found the same way regardless of where you run the command from. */
+(function loadDotEnv() {
+  const envPath = fileURLToPath(new URL('.env', import.meta.url));
+  if (!existsSync(envPath)) return;
+  for (const line of readFileSync(envPath, 'utf8').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+})();
 
 const API = process.env.REEF_API || 'https://ledgerbal.com/api/reef';
 const WS_BASE = process.env.REEF_WS || 'wss://ledgerbal.com/ws/reef/';

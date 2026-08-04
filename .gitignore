@@ -1,2 +1,3 @@
 agent/*.json
 agent/*.lock
+agent/.env
