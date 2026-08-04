@@ -23,6 +23,7 @@
 
 import { webcrypto as crypto } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 const API = process.env.REEF_API || 'https://ledgerbal.com/api/reef';
@@ -414,8 +415,64 @@ export class ReefAgent {
   }
 }
 
+/* --- exclusive lock for `listen` ----------------------------------------
+ *
+ * Two `listen` processes on the same state file both hold a valid cached
+ * session (same device, same token) and would both open their own socket —
+ * the server has no reason to refuse either. Every `msg.new` then reaches
+ * both, both mark it read (harmless), and both call the handler: whoever is
+ * driving each one replies twice, once per process. This is not hypothetical
+ * — it is exactly what "two Claude Code sessions both say 'go reef way'"
+ * produces with no guard at all.
+ *
+ * A PID lock file next to the state file is enough: `listen` refuses to
+ * start if another `listen` for the same state file is already alive, and
+ * cleans a stale lock left by a process that died without removing it.
+ */
+function lockPathFor(statePath) {
+  return statePath + '.lock';
+}
+
+function acquireLock(statePath) {
+  const lockPath = lockPathFor(statePath);
+  if (existsSync(lockPath)) {
+    const pid = Number(readFileSync(lockPath, 'utf8').trim());
+    const alive = pid && (() => {
+      try {
+        process.kill(pid, 0); // signal 0: existence check, does not actually signal
+        return true;
+      } catch (e) {
+        return false; // ESRCH: no such process — the lock is stale
+      }
+    })();
+    if (alive) {
+      throw new Error(
+        `Another 'listen' is already running for ${statePath} (pid ${pid}). ` +
+        `Two listeners on the same identity double-act on every message — stop ` +
+        `that one first (or use a different --state) rather than running both.`
+      );
+    }
+  }
+  writeFileSync(lockPath, String(process.pid));
+  const release = () => {
+    try {
+      if (Number(readFileSync(lockPath, 'utf8').trim()) === process.pid) unlinkSync(lockPath);
+    } catch (e) {
+      /* already gone */
+    }
+  };
+  process.on('exit', release);
+  process.on('SIGINT', () => process.exit(130));
+  process.on('SIGTERM', () => process.exit(143));
+}
+
 /* --- CLI ---------------------------------------------------------------- */
 
+/* Compared against a raw `file://${...}` template before — correct on
+ * Linux/Mac, but process.argv[1] is a backslash path on Windows
+ * (`D:\...\reef-agent.mjs`), which never matches that string. The guard
+ * silently failed closed: no error, no output, exit 0, having done nothing.
+ * pathToFileURL normalises either way. */
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = process.argv.slice(2);
   const flag = (name, fallback) => {
@@ -467,6 +524,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     // message, and nothing else, so the decision to wake an LLM turn is "did
     // a line print", not a schedule. Replying is a separate, deliberate
     // `send` call from whoever reads that line.
+    //
+    // Locked so a second `listen` on the same --state refuses to start
+    // instead of silently double-acting on every message alongside the
+    // first one.
+    acquireLock(agent.statePath);
     console.log(`listening on room ${agent.roomId}`);
     await agent.listenLive(async (message) => {
       console.log(`REEF_MSG ${JSON.stringify({ id: message.id, from: message.from, at: message.at, text: message.text })}`);
