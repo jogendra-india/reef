@@ -1190,6 +1190,60 @@
     return !body.text && !(message.attachments || []).length;
   }
 
+  /* Retries a run of messages that currently read as unreadable, by asking
+   * the server for that seq range again. The envelope is never deleted
+   * server-side, so this is a real second chance rather than theatre — it
+   * is the only way back for a message whose one and only ingest landed
+   * while a key was briefly missing, since the plaintext attempt is not
+   * something this device kept a copy of to retry from.
+   *
+   * Keyed by the run's own seq range so the same broken stretch is not
+   * re-requested on every render; a stretch that is genuinely gone (no
+   * envelope ever existed for it) just fails the same way again once and
+   * is then left alone for the rest of this session. */
+  const healedRuns = new Set();
+  async function healRun(run) {
+    const first = run[0];
+    const last = run[run.length - 1];
+    if (!first || !last || !first.seq || !last.seq) return;
+    const key = first.seq + ':' + last.seq;
+    if (healedRuns.has(key)) return;
+    healedRuns.add(key);
+    let since = first.seq - 1;
+    let fetchedAny = false;
+    try {
+      while (since < last.seq) {
+        const page = await API.history({ since, page_size: 200 });
+        const rows = page.results || [];
+        if (!rows.length) break;
+        fetchedAny = true;
+        await ingest(rows, false);
+        since = rows[rows.length - 1].seq;
+      }
+    } catch (e) {
+      healedRuns.delete(key); // offline, or a blip — worth trying again later
+      return;
+    }
+    if (fetchedAny) renderList(true);
+  }
+
+  /* Same retry, swept across everything currently held rather than only what
+   * is on screen — for a manual nudge, or a one-off pass over local history. */
+  async function healUnreadable() {
+    const rows = ordered();
+    let i = 0;
+    while (i < rows.length) {
+      if (!unreadable(rows[i])) {
+        i++;
+        continue;
+      }
+      let last = i;
+      while (last + 1 < rows.length && unreadable(rows[last + 1])) last++;
+      await healRun(rows.slice(i, last + 1));
+      i = last + 1;
+    }
+  }
+
   /* Housekeeping, not conversation: the profile announcement that carries a
    * handle and a fish travels as an ordinary encrypted message so the server
    * never learns either.
@@ -1318,6 +1372,15 @@
               : `${count} earlier messages cannot be opened on this device`
           )
         );
+        // The server keeps every envelope forever, so a run that reads as
+        // broken is not necessarily gone for good — it may just be the one
+        // history page that got ingested while a key was briefly missing
+        // (refreshKeys mid-flight, a device swap). Recent pages get re-synced
+        // constantly and shrug that off on their own; a page loaded once by
+        // scrolling here never comes through again on its own. Scrolling to
+        // it is the only signal this range still matters, so that is the
+        // trigger to ask the server for it again.
+        healRun(visible.slice(index, last + 1));
         index = last;
         lastDay = null; // the next real message re-states its day
         continue;
