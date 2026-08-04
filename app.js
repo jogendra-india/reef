@@ -644,15 +644,27 @@
     const result = await API.keys();
     state.recipients = result.recipients || [];
     state.session.safety_number = result.safety_number;
-    state.pairKeys = {};
+    // Built up separately and swapped in as one assignment, not cleared then
+    // refilled in place. `derivePairKey` awaits WebCrypto, so clearing first
+    // left a real gap — several event-loop turns wide — where any decrypt
+    // running concurrently (a scroll pulling in older history, a message
+    // arriving) read pairKeys as empty for a peer it already had a perfectly
+    // good key for, and wrote that message to disk as permanently
+    // undecryptable. Recent messages get re-ingested constantly and shrug
+    // that off; a page loaded once by scrolling up never comes through
+    // ingest again, so the placeholder stuck for good. The old key stays
+    // valid for every already-known peer for the entire duration of this
+    // function now, so there is no gap for them to be caught in.
+    const nextKeys = {};
     for (const recipient of state.recipients) {
-      state.pairKeys[recipient.id] = await C.derivePairKey(
+      nextKeys[recipient.id] = await C.derivePairKey(
         state.identity.privateKey,
         recipient.public_key_jwk,
         state.device.id,
         recipient.id
       );
     }
+    state.pairKeys = nextKeys;
     paintHeader();
     paintPeerMissing();
     // Whoever just appeared has to be told who you are, and this is the one
