@@ -4360,7 +4360,12 @@
 
   function idleReset() {
     clearTimeout(idleTimer);
-    if (state.locked || document.visibilityState !== 'visible') return;
+    // A room that skips peer approval for devices has, by the same
+    // administrative decision, opted out of the idle lock too — it exists to
+    // protect a conversation left open on a desk, which is not the shape of
+    // an always-on agent channel.
+    if (state.locked || document.visibilityState !== 'visible' ||
+        (state.session && state.session.auto_approve_devices)) return;
     idleTimer = setTimeout(() => {
       if (!state.locked) lockNow();
     }, IDLE_LOCK);
@@ -4389,7 +4394,9 @@
         $('privacy').classList.add('on');
       } else {
         $('privacy').classList.remove('on');
-        if (state.hiddenAt && Date.now() - state.hiddenAt > LOCK_AFTER && !state.locked) {
+        const skipsIdleLock = state.session && state.session.auto_approve_devices;
+        if (state.hiddenAt && Date.now() - state.hiddenAt > LOCK_AFTER && !state.locked &&
+            !skipsIdleLock) {
           lockNow();
         } else {
           markVisibleRead();

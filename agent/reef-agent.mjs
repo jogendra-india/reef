@@ -25,6 +25,7 @@ import { webcrypto as crypto } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 
 const API = process.env.REEF_API || 'https://ledgerbal.com/api/reef';
+const WS_BASE = process.env.REEF_WS || 'wss://ledgerbal.com/ws/reef/';
 
 const PAIR_INFO = 'reef/v1/pair';
 const MSG_INFO = 'reef/v1/msg|';
@@ -254,6 +255,27 @@ export class ReefAgent {
     return result;
   }
 
+  /* Shared by `read` (a page from the REST history) and the WS listener (one
+   * row at a time, live) — same row shape either way, same decrypt rule. */
+  async _textFor(row) {
+    if (row.mine) {
+      // Ours: no envelope exists for us, so the local copy is the only source.
+      return (this.state.sent || {})[row.id] ?? null;
+    }
+    if (!row.envelope) return null;
+    const key = this.pairKeys.get(String(row.sender_device_id));
+    if (!key) return null;
+    try {
+      const body = await open(key, row.envelope, {
+        messageId: row.id, senderDeviceId: row.sender_device_id,
+        recipientDeviceId: this.deviceId,
+      });
+      return body.text ?? null;
+    } catch (e) {
+      return null; // sealed for a device since replaced
+    }
+  }
+
   /* Everything since the last call. `seq` is a total order from the server, so
    * this is resumable across restarts — it is kept in the state file. */
   async read({ since = this.state.seq, pageSize = 50 } = {}) {
@@ -263,26 +285,8 @@ export class ReefAgent {
     const out = [];
     for (const row of results) {
       if (row.seq > (this.state.seq || 0)) this.state.seq = row.seq;
-      let text = null;
-      if (row.mine) {
-        // Ours: no envelope exists for us, so the local copy is the only source.
-        text = (this.state.sent || {})[row.id] ?? null;
-      } else if (row.envelope) {
-        const key = this.pairKeys.get(String(row.sender_device_id));
-        if (key) {
-          try {
-            const body = await open(key, row.envelope, {
-              messageId: row.id, senderDeviceId: row.sender_device_id,
-              recipientDeviceId: this.deviceId,
-            });
-            text = body.text ?? null;
-          } catch (e) {
-            text = null; // sealed for a device since replaced
-          }
-        }
-      }
       out.push({ id: row.id, seq: row.seq, mine: row.mine, at: row.created_at,
-                 from: row.sender_device_id, text, deleted: row.deleted });
+                 from: row.sender_device_id, text: await this._textFor(row), deleted: row.deleted });
     }
     await this.save();
     return out;
@@ -313,6 +317,99 @@ export class ReefAgent {
       }
       await new Promise((r) => setTimeout(r, every));
     }
+  }
+
+  /* Push instead of poll: one request only when something actually happens,
+   * rather than one every `every` ms regardless. The ticket is single-use
+   * and dies in 60s (`ReefWsTicketView`), so a fresh one is pulled for every
+   * connect, including every reconnect after a drop — there is no "renew".
+   *
+   * `catch_up` runs once up front and on every reconnect, because a socket
+   * only ever carries what happens *while it's open* — anything that arrived
+   * during a drop, or before this call started, is invisible to it otherwise.
+   */
+  async listenLive(handler) {
+    let backoff = 1000;
+    for (;;) {
+      try {
+        await this._catchUp(handler);
+        await this._runSocket(handler);
+        backoff = 1000; // a clean open-then-close is not a failure to back off from
+      } catch (e) {
+        if (e.status === 401) throw e; // revoked: no amount of retrying helps
+        process.stderr.write(`reef: ${e.message}\n`);
+      }
+      const wait = Math.min(backoff, 30000) * (0.7 + Math.random() * 0.6);
+      backoff = Math.min(backoff * 2, 30000);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+
+  async _catchUp(handler) {
+    const fresh = (await this.read()).filter((m) => !m.mine && m.text !== null);
+    if (fresh.length) {
+      await this.markRead(fresh.map((m) => m.id));
+      for (const message of fresh) await handler(message, this);
+    }
+  }
+
+  /* One socket, until it closes or errors. Resolves normally on a clean
+   * close so the caller can decide whether/how to reconnect. */
+  _runSocket(handler) {
+    return new Promise(async (resolve, reject) => {
+      let ticket;
+      try {
+        ({ ticket } = await request('/ws-ticket/', { method: 'POST', token: this.token }));
+      } catch (e) {
+        return reject(e);
+      }
+      const socket = new WebSocket(`${WS_BASE}?t=${encodeURIComponent(ticket)}`);
+      let heartbeat = null;
+
+      socket.onopen = () => {
+        heartbeat = setInterval(() => {
+          try {
+            socket.send(JSON.stringify({ type: 'ping' }));
+          } catch (e) {
+            /* socket already going down; onclose will fire */
+          }
+        }, 20000);
+      };
+
+      socket.onmessage = async (event) => {
+        let payload;
+        try {
+          payload = JSON.parse(event.data);
+        } catch (e) {
+          return;
+        }
+        if (payload.type !== 'msg.new') return;
+        const row = payload.message;
+        if (row.mine) return;
+        if (row.seq > (this.state.seq || 0)) this.state.seq = row.seq;
+        const text = await this._textFor(row);
+        if (text === null) return; // undecryptable, or a system/profile row
+        await this.save();
+        await this.markRead([row.id]);
+        await handler({
+          id: row.id, seq: row.seq, mine: false, at: row.created_at,
+          from: row.sender_device_id, text, deleted: row.deleted,
+        }, this);
+      };
+
+      socket.onerror = () => {
+        try {
+          socket.close();
+        } catch (e) {
+          /* already closing */
+        }
+      };
+
+      socket.onclose = () => {
+        clearInterval(heartbeat);
+        resolve();
+      };
+    });
   }
 }
 
@@ -364,13 +461,13 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       await self.send(`heard: ${message.text}`);
     });
   } else if (command === 'listen') {
-    // Same polling loop as `watch`, but never replies on its own — this is
-    // the half meant to sit behind Monitor: one clean stdout line per real
-    // incoming message, and nothing else, so the decision to wake an LLM
-    // turn is "did a line print", not a schedule. Replying is a separate,
-    // deliberate `send` call from whoever reads that line.
+    // Push, not poll, and never replies on its own — this is the half meant
+    // to sit behind Monitor: one clean stdout line per real incoming
+    // message, and nothing else, so the decision to wake an LLM turn is "did
+    // a line print", not a schedule. Replying is a separate, deliberate
+    // `send` call from whoever reads that line.
     console.log(`listening on room ${agent.roomId}`);
-    await agent.watch(async (message) => {
+    await agent.listenLive(async (message) => {
       console.log(`REEF_MSG ${JSON.stringify({ id: message.id, from: message.from, at: message.at, text: message.text })}`);
     });
   } else {
