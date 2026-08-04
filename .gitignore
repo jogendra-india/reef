@@ -1,3 +1,5 @@
 agent/*.json
 agent/*.lock
 agent/.env
+agent/*.log
+agent/*.stop
