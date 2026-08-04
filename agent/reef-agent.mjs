@@ -23,6 +23,7 @@
 
 import { webcrypto as crypto } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 const API = process.env.REEF_API || 'https://ledgerbal.com/api/reef';
 const WS_BASE = process.env.REEF_WS || 'wss://ledgerbal.com/ws/reef/';
@@ -415,7 +416,7 @@ export class ReefAgent {
 
 /* --- CLI ---------------------------------------------------------------- */
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = process.argv.slice(2);
   const flag = (name, fallback) => {
     const i = args.indexOf('--' + name);
