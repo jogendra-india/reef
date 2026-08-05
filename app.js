@@ -117,6 +117,9 @@
     // reads every one of them.
     selecting: false,
     selection: new Set(),
+    // Id of the one message whose text is currently selectable by hand, if any.
+    // See startTextPick — row gestures stand down for as long as it is set.
+    picking: null,
     devices: [],
     pendingDevices: [],
     // Mirrors the stored setting so the menu can label the bell without an await.
@@ -1354,6 +1357,10 @@
     const scroller = $('scroller');
     const list = $('list');
 
+    // Every row here is about to be rebuilt, the selected bubble included, so
+    // anything mid-pick is already over — the flag has to go with it or row
+    // gestures stay switched off over a selection that is no longer on screen.
+    if (state.picking) endTextPick();
 
     /* Which message is at the top edge, and exactly where.
      *
@@ -2521,12 +2528,15 @@
     // press and the reply swipe both belong to the single-message sheet,
     // which selection mode is a replacement for, not a companion to.
     row.addEventListener('click', () => {
+      if (state.picking) return;
       if (state.selecting) toggleSelect(message.id);
     });
 
     row.addEventListener(
       'pointerdown',
       (event) => {
+        // A press while text is being picked belongs to the selection handles.
+        if (state.picking) return;
         if (state.selecting) return;
         // A right-click is the context menu, not the start of a swipe.
         if (event.pointerType === 'mouse' && event.button !== 0) return;
@@ -2586,6 +2596,10 @@
     row.addEventListener('pointerup', release, { passive: true });
     row.addEventListener('pointercancel', release, { passive: true });
     row.addEventListener('contextmenu', (event) => {
+      // Deliberately *not* suppressed while text is being picked: the browser's
+      // own menu is the right one there, because it offers Copy for the
+      // selection the reader just made. Ours has no equivalent.
+      if (state.picking) return;
       // The native menu is still suppressed — it offers "Copy image", "Save
       // as", "Search the web for…", none of which belong here. But suppressing
       // it and putting nothing in its place left a desktop browser with no
@@ -2599,6 +2613,62 @@
       opened = true;
       openMessageSheet(message);
     });
+  }
+
+  /* ==================================================================== *
+   * Copying part of a message
+   * ==================================================================== *
+   *
+   * A bubble sets user-select:none, and has to: a long press is how the message
+   * sheet opens, and the OS text-selection UI would claim that gesture instead.
+   * The cost was that the sheet's Copy could only ever take the whole message.
+   *
+   * So selection is turned back on for the one bubble the reader picked, seeded
+   * with the full text so the handles come up already placed, and narrowing it
+   * is left to them — after which the copy is the platform's own, not ours.
+   * Nothing here touches the clipboard.
+   *
+   * Row gestures stand down for as long as it lasts. A handle dragged across a
+   * bubble still answering pointermove would fight the reply swipe, and a
+   * finger held still over one would reopen the sheet on top of the selection.
+   */
+  let pickExit = null;
+
+  function endTextPick() {
+    if (pickExit) {
+      document.removeEventListener('pointerdown', pickExit, true);
+      pickExit = null;
+    }
+    if (!state.picking) return;
+    const bubble = $('list').querySelector('.bubble.picking');
+    if (bubble) bubble.classList.remove('picking');
+    state.picking = null;
+  }
+
+  function startTextPick(message) {
+    endTextPick();
+    const row = $('list').querySelector(`[data-id="${CSS.escape(message.id)}"]`);
+    const bubble = row && row.querySelector('.bubble');
+    const text = bubble && bubble.querySelector('.txt');
+    if (!text) return;
+    state.picking = message.id;
+    bubble.classList.add('picking');
+
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+
+    // Anything outside this bubble ends it. Capture phase, so it runs ahead of
+    // the row handlers it exists to re-enable — and a press on the bubble
+    // itself is excluded, since dragging a handle lands there.
+    pickExit = (event) => {
+      if (bubble.contains(event.target)) return;
+      endTextPick();
+    };
+    document.addEventListener('pointerdown', pickExit, true);
+    toast('Drag the handles, then copy');
   }
 
   /* ==================================================================== *
@@ -2707,6 +2777,9 @@
             navigator.clipboard.writeText(message.body.text);
             toast('Copied');
           });
+          // The whole message is one tap; a phrase out of the middle of it was
+          // not possible at all until this.
+          action('⌶', 'Select text', () => startTextPick(message));
         }
         if (message.mine && withinEditWindow(message)) {
           action('✎', 'Edit', () => startEdit(message));

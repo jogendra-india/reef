@@ -128,6 +128,13 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .row.tail:not(.mine) .bubble{border-bottom-left-radius:6px;}
 .row.tail.mine .bubble{border-bottom-right-radius:6px;}
 .bubble .txt{white-space:pre-wrap;}
+/* Selection is off on a bubble above, and has to be: a long press is how the
+   message sheet opens, and the OS text-selection UI would take that gesture
+   for itself. "Select text" in the sheet turns it back on for the one bubble
+   the reader asked for, which is the only way to copy part of a message
+   instead of all of it. */
+.bubble.picking{-webkit-touch-callout:default;-webkit-user-select:text;user-select:text;}
+.bubble.picking .txt{-webkit-user-select:text;user-select:text;}
 .bubble.jumbo .txt{font-size:40px;line-height:1.2;}
 .bubble.jumbo{background:none!important;padding:2px 4px;}
 
