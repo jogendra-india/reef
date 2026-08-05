@@ -117,6 +117,10 @@
     // reads every one of them.
     selecting: false,
     selection: new Set(),
+    // null until the socket's opening frame settles it: true if the far end
+    // sends hello and relays presence beats, false if it turned out to be an
+    // older server. See expectHello.
+    serverBeats: null,
     // Id of the one message whose text is currently selectable by hand, if any.
     // See startTextPick — row gestures stand down for as long as it is set.
     picking: null,
@@ -468,8 +472,7 @@
   async function enterRoom(roomId, prefetched) {
     if (state.stream) state.stream.close();
     state.stream = null;
-    clearInterval(devicesTimer);
-    clearInterval(presenceTimer);
+    stopRoomTimers();
     state.messages = new Map();
     // The DOM, not only the state. Clearing state.messages here meant the
     // *next* renderList() would draw the right room — but showScreen('pool')
@@ -568,8 +571,12 @@
     // WebSocket event. Anyone who was not looking at the screen at that moment
     // — app closed, backgrounded, reconnecting — never learned about it. Asking
     // on the way in means a request that arrived overnight is still visible.
+    //
+    // The socket's hello frame carries this too, and arrives seconds later. This
+    // call stays because it does not depend on a socket: where WebSocket is
+    // blocked outright, it is the only thing that ever populates the list, and
+    // the app has to stay usable there.
     refreshDevices();
-    watchDevices();
     await loadProfileSettings();
     await refreshKeys();
     // After refreshKeys, because re-deriving `mine` on the copied rows needs to
@@ -628,8 +635,7 @@
    * thread is where you left it. */
   async function signOut({ keepHistory = false } = {}) {
     clearInterval(approvalTimer);
-    clearInterval(devicesTimer);
-    clearInterval(presenceTimer);
+    stopRoomTimers();
     if (state.stream) state.stream.close();
     if (keepHistory) {
       await DB.forgetSessions();
@@ -1138,6 +1144,46 @@
    * blind, which is exactly how it looked: only ever one of them online. */
   const PRESENCE_TTL = 45000;
 
+  /* One expiry timer per peer device, reset by every beat that device sends.
+   *
+   * Presence has to be able to lapse on its own. A browser killed outright never
+   * sends the disconnect that would clear it, so silence is the only evidence
+   * there will ever be — and silence is not an event. This used to be covered by
+   * re-asking the server every thirty seconds; now the server relays each ping
+   * to the room, and running the clock locally against those beats costs nothing
+   * and needs no timer of its own between them. */
+  const presenceTimers = new Map();
+
+  /* `beatAt` is when *this* client saw the beat. For a live event that is now,
+   * which keeps the countdown immune to any clock difference between the two
+   * ends. Only a seeded snapshot has to trust the server's own timestamp, having
+   * nothing better to go on. */
+  function markPeerLive(id, lastSeenIso, beatAt) {
+    const remaining = PRESENCE_TTL - (Date.now() - beatAt);
+    if (remaining <= 0) return dropPeerLive(id, lastSeenIso);
+    clearTimeout(presenceTimers.get(id));
+    // Nothing to count down against on a server that does not relay beats. See
+    // expectHello: there, presence lives and dies by connect and disconnect
+    // alone, exactly as it did before, and the poll covers the rest.
+    if (state.serverBeats !== false) {
+      presenceTimers.set(id, setTimeout(() => dropPeerLive(id, lastSeenIso), remaining));
+    }
+    if (!state.peerLive.includes(id)) state.peerLive = [...state.peerLive, id];
+    state.peerOnline = true;
+    paintHeader();
+  }
+
+  function dropPeerLive(id, lastSeenIso) {
+    clearTimeout(presenceTimers.get(id));
+    presenceTimers.delete(id);
+    state.peerLive = state.peerLive.filter((live) => live !== id);
+    state.peerOnline = state.peerLive.length > 0;
+    // The last moment they were known to be there, which is the beat that just
+    // ran out — not now, when all that happened is that nothing arrived.
+    if (lastSeenIso && !state.peerOnline) state.lastSeen = lastSeenIso;
+    paintHeader();
+  }
+
   function seedPresence() {
     const peers = (state.session && state.session.peer_devices) || [];
     const fresh = peers.filter(
@@ -1146,8 +1192,14 @@
         d.last_seen &&
         Date.now() - new Date(d.last_seen).getTime() < PRESENCE_TTL
     );
-    state.peerLive = fresh.map((d) => String(d.id));
-    state.peerOnline = state.peerLive.length > 0;
+    const live = new Set(fresh.map((d) => String(d.id)));
+    // A snapshot replaces what was known rather than adding to it: a device
+    // absent from it has gone, and waiting for its own timer to notice would
+    // leave it shown as swimming for up to another full window.
+    state.peerLive.filter((id) => !live.has(id)).forEach((id) => dropPeerLive(id, null));
+    fresh.forEach((d) =>
+      markPeerLive(String(d.id), d.last_seen, new Date(d.last_seen).getTime())
+    );
     if (!state.peerOnline) {
       const seen = peers
         .map((d) => d.last_seen)
@@ -1158,10 +1210,9 @@
     paintHeader();
   }
 
-  /* Re-asks for the session, because presence cannot be inferred from silence.
-   * Needed on reconnect — any announce made while the socket was down is simply
-   * gone — and periodically, since a browser killed outright never sends the
-   * disconnect that would have cleared it. */
+  /* The session, re-asked. No longer on a timer — the socket's opening frame
+   * carries this, so the only caller left is the fallback that runs when no
+   * socket can be established at all. */
   async function refreshPresence() {
     try {
       const result = await API.session();
@@ -3129,10 +3180,18 @@
 
   async function refreshDevices() {
     try {
-      state.devices = (await API.devices()).devices || [];
+      await applyDevices((await API.devices()).devices || []);
     } catch (e) {
-      return; // offline; whatever was last known stays on screen
+      /* offline; whatever was last known stays on screen */
     }
+  }
+
+  /* Everything that follows from knowing the room's devices, wherever the list
+   * came from. The socket's opening frame carries the same list, and used to
+   * have no way to feed it through here — so the REST call was the only route
+   * and a timer was the only thing keeping it current. */
+  async function applyDevices(devices) {
+    state.devices = devices;
     // Only the other person's pending devices are actionable here — this side
     // cannot let its own second phone in, by design.
     state.pendingDevices = state.devices.filter(
@@ -3165,22 +3224,91 @@
     }
   }
 
-  let devicesTimer = null;
-  let presenceTimer = null;
+  /* REST, on a timer, for as long as no socket can be built at all.
+   *
+   * The device list and the session used to be polled every sixty and thirty
+   * seconds whatever the socket was doing. They are in the socket's opening
+   * frame now, so a healthy client makes neither call — but "healthy" cannot be
+   * assumed. A network that blocks WebSocket outright leaves a client with no
+   * route to any of this, and it worked before, so it has to keep working.
+   *
+   * Armed only once the socket has been down long enough to look like more than
+   * a blip, and disarmed the moment one connects. Nothing runs in the ordinary
+   * case, which is the whole point. */
+  const FALLBACK_AFTER = 60000;
+  const FALLBACK_EVERY = 60000;
+  let fallbackArmTimer = null;
+  let fallbackTimer = null;
 
-  /* Slow, and only a safety net. device.pending over the WebSocket is the fast
-   * path; this exists so a missed event — a reconnect, a server that never
-   * sends one — cannot leave an approval request invisible for a whole session.
-   * The device doing the waiting already polls every four seconds. */
-  function watchDevices() {
-    clearInterval(devicesTimer);
-    devicesTimer = setInterval(refreshDevices, 60000);
-    clearInterval(presenceTimer);
-    // Deliberately shorter than the server's 45s presence window. A browser
-    // killed outright never sends the disconnect that would clear it, so
-    // "swimming" has to be able to lapse on its own rather than stay true until
-    // something else happens to correct it.
-    presenceTimer = setInterval(refreshPresence, 30000);
+  function armFallback() {
+    if (fallbackTimer) return;
+    fallbackTimer = setInterval(async () => {
+      await refreshDevices();
+      await refreshPresence();
+    }, FALLBACK_EVERY);
+  }
+
+  function disarmFallback() {
+    clearTimeout(fallbackArmTimer);
+    fallbackArmTimer = null;
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+
+  function watchSocketOutage(online) {
+    if (online) return disarmFallback();
+    if (fallbackTimer || fallbackArmTimer) return;
+    fallbackArmTimer = setTimeout(armFallback, FALLBACK_AFTER);
+  }
+
+  /* Everything room-scoped that is waiting on a clock, stopped together.
+   *
+   * The presence timers belong here as much as the fallback does: each one is
+   * holding a device id from the room being left, and left running it would
+   * repaint the header for a peer who is not in the conversation now on screen.
+   * The old pair of polling intervals were torn down at each of these three
+   * points, and their replacements have to be. */
+  function stopRoomTimers() {
+    disarmFallback();
+    clearTimeout(helloTimer);
+    helloTimer = null;
+    presenceTimers.forEach((timer) => clearTimeout(timer));
+    presenceTimers.clear();
+    state.peerLive = [];
+    state.peerOnline = false;
+  }
+
+  /* Whether the server on the far end of this socket is one that sends an
+   * opening frame and relays presence beats.
+   *
+   * It cannot be assumed, and the deploy order must not have to be arranged
+   * around it. This client is a static bundle; the server behind it ships
+   * separately, and either can land first. A client that took the new behaviour
+   * for granted and got an old server would have no device list beyond the one
+   * fetched at unlock, and would start expiring presence against beats that were
+   * never going to arrive — marking the other person gone 45 seconds after
+   * connecting, while they sat there.
+   *
+   * So the socket is given a moment to say hello. If it does not, this reverts
+   * to exactly the polling the hello frame replaced. Nothing needs coordinating;
+   * whichever side is newer, the pair behaves. */
+  const HELLO_GRACE = 5000;
+  let helloTimer = null;
+
+  function expectHello() {
+    clearTimeout(helloTimer);
+    state.serverBeats = null;
+    helloTimer = setTimeout(() => {
+      helloTimer = null;
+      state.serverBeats = false;
+      // No snapshot is coming, so ask for one, and keep asking.
+      refreshDevices();
+      armFallback();
+      // The countdowns started by this connection's presence announcements have
+      // nothing to count against on a server that does not beat.
+      presenceTimers.forEach((timer) => clearTimeout(timer));
+      presenceTimers.clear();
+    }, HELLO_GRACE);
   }
 
   function paintDeviceBanner() {
@@ -4074,12 +4202,16 @@
       onStatus: (status) => {
         state.online = status === 'online';
         paintHeader();
+        watchSocketOutage(state.online);
         if (state.online) {
+          // Every reconnection is a fresh chance for the far end to identify
+          // itself, since it may have been redeployed while this was down.
+          expectHello();
           syncHistory();
           flushOutbox();
-          // Any announce made while this socket was down is gone, so the peer's
-          // state has to be asked for rather than waited on.
-          refreshPresence();
+          // The peer's state used to be re-asked for here, because any announce
+          // made while this socket was down is gone. The hello frame carries it
+          // now, and arrives unprompted a moment after this.
         } else {
           // Our own socket is down; we know nothing about them any more.
           state.peerLive = [];
@@ -4094,6 +4226,30 @@
   let typingTimer;
   async function handleEvent(event) {
     switch (event.type) {
+      /* The opening frame, and the whole reason nothing polls any more.
+       *
+       * It carries what the two timers used to fetch — the device list, the
+       * session, who is swimming — so every reconnect is a full resync. Anything
+       * missed while the socket was down is delivered on the way back in, which
+       * is a stronger guarantee than a thirty-second poll ever gave, and the
+       * watchdog in createStream is what makes sure a reconnect actually
+       * happens. */
+      case 'hello': {
+        clearTimeout(helloTimer);
+        helloTimer = null;
+        // Proof the far end beats, so presence may be expired against those
+        // beats and the polling fallback is not needed.
+        state.serverBeats = true;
+        disarmFallback();
+        state.device = event.device || state.device;
+        if (event.session) {
+          state.session = Object.assign({}, state.session, event.session);
+        }
+        if (event.devices) await applyDevices(event.devices);
+        seedPresence();
+        break;
+      }
+
       // The delivered receipt is no longer sent from here. ingest confirms
       // everything it takes in, which covers this *and* the history sync that
       // used to acknowledge nothing.
@@ -4218,16 +4374,11 @@
         if (!who || who === String(state.device.id)) break;
         if (!peerRecipients().some((r) => String(r.id) === who)) break;
 
-        const live = new Set(state.peerLive);
-        if (event.status === 'online') {
-          live.add(who);
-        } else {
-          live.delete(who);
-          state.lastSeen = event.at;
-        }
-        state.peerLive = [...live];
-        state.peerOnline = state.peerLive.length > 0;
-        paintHeader();
+        // Arrives on connect, on disconnect, and now on every heartbeat, which
+        // is what lets the countdown in markPeerLive stand in for the poll that
+        // used to ask whether they were still there.
+        if (event.status === 'online') markPeerLive(who, event.at, Date.now());
+        else dropPeerLive(who, event.at);
         break;
       }
 
@@ -4445,8 +4596,7 @@
     // it locked. The live socket goes too: a locked app has no business
     // heartbeating presence or taking delivery of anything.
     await DB.setLocked(true).catch(() => {});
-    clearInterval(devicesTimer);
-    clearInterval(presenceTimer);
+    stopRoomTimers();
     if (state.stream) state.stream.close();
     state.stream = null;
     // Both sit above the lock screen in the stacking order, so leaving either
@@ -4520,6 +4670,11 @@
         } else {
           markVisibleRead();
           flushOutbox();
+          // Coming back to the front is when the socket is most likely to have
+          // died without saying so — timers were throttled the whole time it was
+          // away, so the heartbeat that would notice may be most of a minute
+          // off. Ask now rather than wait for it.
+          if (state.stream) state.stream.poke();
           // Back on screen, so the idle clock starts again from zero.
           idleReset();
         }

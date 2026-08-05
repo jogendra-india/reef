@@ -130,11 +130,21 @@
 
   /* --- Live stream ------------------------------------------------------- */
 
+  /* How many pings may go unanswered before the socket is treated as dead.
+   *
+   * Counted in pings rather than in seconds deliberately. A backgrounded tab has
+   * its timers throttled to roughly one a minute, so any wall-clock deadline
+   * would condemn a perfectly healthy socket the moment the phone went in a
+   * pocket. A ping that got no answer is evidence whenever it was sent. */
+  const MISSED_PONGS_DEAD = 2;
+
   function createStream(handlers) {
     let socket = null;
     let heartbeat = null;
     let backoff = 1000;
     let closed = false;
+    let missed = 0;
+    let lastFrame = 0;
 
     async function connect() {
       if (closed || (socket && socket.readyState <= 1)) return;
@@ -149,13 +159,29 @@
 
       socket.onopen = () => {
         backoff = 1000;
+        missed = 0;
+        lastFrame = Date.now();
         handlers.onStatus && handlers.onStatus('online');
-        // Doubles as the presence heartbeat: the server treats a device as
-        // "swimming" only while these keep arriving.
-        heartbeat = setInterval(() => send({ type: 'ping' }), 20000);
+        /* Doubles as the presence heartbeat: the server treats a device as
+         * "swimming" only while these keep arriving.
+         *
+         * And, now, as the liveness check. Pongs were read and thrown away, so
+         * nothing ever noticed a socket that had stopped answering — which is
+         * precisely the failure that fires no onclose: a half-open connection
+         * left by a sleeping phone, a NAT timeout, a proxy that drops the flow
+         * without telling either end. The client sat there calling itself online
+         * and receiving nothing until somebody reloaded it. */
+        heartbeat = setInterval(() => {
+          if (missed >= MISSED_PONGS_DEAD) return giveUp();
+          missed++;
+          send({ type: 'ping' });
+        }, 20000);
       };
 
       socket.onmessage = (event) => {
+        // Any frame at all is proof of life, not only a pong.
+        missed = 0;
+        lastFrame = Date.now();
         let payload;
         try {
           payload = JSON.parse(event.data);
@@ -173,6 +199,30 @@
       };
 
       socket.onerror = () => socket && socket.close();
+    }
+
+    /* Tears down a socket the browser still considers open but which is plainly
+     * carrying nothing, and reconnects.
+     *
+     * The handlers come off and the reference is dropped *before* close(),
+     * because closing a half-open connection can take its time arriving or never
+     * arrive at all. Neither a late onclose scheduling a second retry nor
+     * connect()'s readyState guard refusing to build a replacement is wanted. */
+    function giveUp() {
+      const dead = socket;
+      socket = null;
+      clearInterval(heartbeat);
+      missed = 0;
+      if (dead) {
+        dead.onopen = dead.onmessage = dead.onclose = dead.onerror = null;
+        try {
+          dead.close();
+        } catch (e) {
+          /* already gone */
+        }
+      }
+      handlers.onStatus && handlers.onStatus('offline');
+      retry();
     }
 
     function retry() {
@@ -195,6 +245,26 @@
     return {
       connect,
       send,
+      /* Checks the socket now instead of waiting for the next heartbeat, and
+       * rebuilds it if there is nothing there.
+       *
+       * For the moment a tab comes back to the front. Its timers have been
+       * throttled, so the heartbeat could be most of a minute from firing, and
+       * that is exactly when the socket is most likely to have died unnoticed.
+       * The five-second deadline is wall-clock, which is safe here in a way it
+       * would not be inside the heartbeat: the tab is foreground, the ping has
+       * just gone out by hand, and a live socket answers in milliseconds. */
+      poke: () => {
+        if (closed) return;
+        if (!socket || socket.readyState > 1) return connect();
+        if (socket.readyState !== 1) return;
+        send({ type: 'ping' });
+        setTimeout(() => {
+          if (socket && socket.readyState === 1 && Date.now() - lastFrame > 5000) {
+            giveUp();
+          }
+        }, 5000);
+      },
       close: () => {
         closed = true;
         clearInterval(heartbeat);
