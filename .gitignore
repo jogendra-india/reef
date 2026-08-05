@@ -3,3 +3,6 @@ agent/*.lock
 agent/.env
 agent/*.log
 agent/*.stop
+# Wrapper supervisor pid, written next to the state file. Named
+# <state>.wrapper.pid, so it does not match agent/*.json above.
+agent/*.pid
