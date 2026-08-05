@@ -596,28 +596,65 @@
     tidyLocalStore();
   }
 
+  /* Waiting to be let in.
+   *
+   * This asked /session/ every four seconds — the last poll left, and the one
+   * that could not simply move to the room's socket, because a device waiting for
+   * approval has no business on it. It does have its own device group though, and
+   * that carries the two things it is waiting for: its own approval and its own
+   * refusal. So it can wait on the socket like everything else.
+   *
+   * The poll stays as a fallback, at a fifth of the rate, for a network that
+   * blocks WebSocket outright. Twenty seconds is slow enough to cost nothing and
+   * quick enough that nobody watching the screen wonders whether it is stuck.
+   */
+  const APPROVAL_POLL = 20000;
   let approvalTimer = null;
-  function pollForApproval() {
+  let approvalStream = null;
+
+  function stopWaitingForApproval() {
     clearInterval(approvalTimer);
-    approvalTimer = setInterval(async () => {
-      try {
-        const result = await API.session();
-        if (result.device.status === 'active') {
-          clearInterval(approvalTimer);
-          state.device = result.device;
-          state.session = result.session;
-          toast('Approved. Welcome in.');
-          await afterUnlock();
-        } else if (result.device.status === 'revoked') {
-          clearInterval(approvalTimer);
-          // Turned down. This device may have been active before and still hold
-          // messages, and being refused entry is no reason to destroy them.
-          await signOut({ keepHistory: true });
-        }
-      } catch (e) {
-        /* offline; keep waiting */
+    approvalTimer = null;
+    if (approvalStream) approvalStream.close();
+    approvalStream = null;
+  }
+
+  /* The socket only ever says "look again" — the answer comes from /session/,
+   * which is the same check the poll made and already handles every outcome. An
+   * event that merely triggers it cannot be wrong about what happened, and this
+   * device's own status is not something to take on trust from a frame. */
+  async function checkApproval() {
+    try {
+      const result = await API.session();
+      if (result.device.status === 'active') {
+        stopWaitingForApproval();
+        state.device = result.device;
+        state.session = result.session;
+        toast('Approved. Welcome in.');
+        await afterUnlock();
+      } else if (result.device.status === 'revoked') {
+        stopWaitingForApproval();
+        // Turned down. This device may have been active before and still hold
+        // messages, and being refused entry is no reason to destroy them.
+        await signOut({ keepHistory: true });
       }
-    }, 4000);
+    } catch (e) {
+      /* offline; keep waiting */
+    }
+  }
+
+  function pollForApproval() {
+    stopWaitingForApproval();
+    approvalStream = API.createStream({
+      onStatus: () => {},
+      onEvent: (event) => {
+        if (event.type === 'device.approved' || event.type === 'device.revoked') {
+          checkApproval();
+        }
+      },
+    });
+    approvalStream.connect();
+    approvalTimer = setInterval(checkApproval, APPROVAL_POLL);
   }
 
   /* Two different things, previously conflated.
@@ -634,7 +671,7 @@
    * after the other person approves it, since the room now has messages — and the
    * thread is where you left it. */
   async function signOut({ keepHistory = false } = {}) {
-    clearInterval(approvalTimer);
+    stopWaitingForApproval();
     stopRoomTimers();
     if (state.stream) state.stream.close();
     if (keepHistory) {
@@ -5139,7 +5176,7 @@
     // IndexedDB: wiping the keypair here would strand an orphan device row and
     // throw away the identity for no reason.
     $('pending-retry').addEventListener('click', () => {
-      clearInterval(approvalTimer);
+      stopWaitingForApproval();
       lockNow();
     });
     /* Erasing is right for "this browser is not mine any more" and wrong for
