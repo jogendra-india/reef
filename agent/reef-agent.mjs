@@ -398,9 +398,33 @@ export class ReefAgent {
       }
       const socket = new WebSocket(`${WS_BASE}?t=${encodeURIComponent(ticket)}`);
       let heartbeat = null;
+      let missed = 0;
+
+      /* Tears down a socket that is open as far as this process is concerned but
+       * is carrying nothing, so onclose fires and the caller reconnects.
+       *
+       * Without this the only failure the agent could see was a socket that
+       * closed properly. A half-open connection — the far side gone, no FIN ever
+       * delivered — left it sitting there connected and deaf, and the wrapper
+       * script could not help: the process is alive and the loop only restarts
+       * on exit. Messages simply stopped arriving, indefinitely. */
+      const giveUp = () => {
+        clearInterval(heartbeat);
+        try {
+          socket.close();
+        } catch (e) {
+          /* already going down */
+        }
+      };
 
       socket.onopen = () => {
+        missed = 0;
         heartbeat = setInterval(() => {
+          // Two unanswered pings, counted rather than timed: the same reasoning
+          // as the browser client, where a throttled timer makes any wall-clock
+          // deadline lie about a healthy socket.
+          if (missed >= 2) return giveUp();
+          missed++;
           try {
             socket.send(JSON.stringify({ type: 'ping' }));
           } catch (e) {
@@ -410,6 +434,8 @@ export class ReefAgent {
       };
 
       socket.onmessage = async (event) => {
+        // Any frame is proof of life, not only a pong.
+        missed = 0;
         let payload;
         try {
           payload = JSON.parse(event.data);
