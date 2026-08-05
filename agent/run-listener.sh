@@ -27,7 +27,7 @@ STOP_FILE="${STATE}.stop"
 rm -f "$STOP_FILE"
 
 while true; do
-  node agent/reef-agent.mjs --state "$STATE" --label "Claude-agent" listen >> agent/listen.log 2>&1
+  node --use-system-ca agent/reef-agent.mjs --state "$STATE" --label "Claude-agent" listen >> agent/listen.log 2>&1
   code=$?
   if [ -f "$STOP_FILE" ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [wrapper] stop file present, exiting (last code $code)" >> agent/listen.log
