@@ -388,17 +388,56 @@ export class ReefAgent {
 
   /* One socket, until it closes or errors. Resolves normally on a clean
    * close so the caller can decide whether/how to reconnect. */
-  _runSocket(handler) {
-    return new Promise(async (resolve, reject) => {
-      let ticket;
-      try {
-        ({ ticket } = await request('/ws-ticket/', { method: 'POST', token: this.token }));
-      } catch (e) {
-        return reject(e);
-      }
-      const socket = new WebSocket(`${WS_BASE}?t=${encodeURIComponent(ticket)}`);
+  async _runSocket(handler) {
+    /* Fetched outside the Promise on purpose. This used to be
+     * `new Promise(async (resolve, reject) => …)`, whose executor returns a
+     * promise nobody holds: anything throwing outside the executor's own
+     * try/catch — the `new WebSocket(…)` line, the handler wiring — rejected
+     * that invisible promise and called neither resolve nor reject, so the
+     * outer one never settled. With no timer and no live handle left, the loop
+     * in listenLive could not reach its backoff sleep, the event loop drained,
+     * and Node exited 13 (unsettled top-level await) rather than reconnecting.
+     * A plain async method rejects through the normal path instead. */
+    const { ticket } = await request('/ws-ticket/', { method: 'POST', token: this.token });
+
+    return new Promise((resolve, reject) => {
+      let socket = null;
       let heartbeat = null;
       let missed = 0;
+      let opened = false;
+      let settled = false;
+
+      /* Every exit routes through here, so the heartbeat and the connect
+       * deadline can never outlive the socket they belong to, and a late
+       * second event cannot re-settle an already-settled promise. */
+      const settle = (err) => {
+        if (settled) return;
+        settled = true;
+        clearInterval(heartbeat);
+        clearTimeout(connectDeadline);
+        if (err) reject(err);
+        else resolve();
+      };
+
+      /* A socket that never reaches onopen does not always reach onclose
+       * either. The heartbeat only exists after onopen, so without a deadline
+       * here that case is the same indefinite hang as above — waiting on a
+       * connection that will never arrive, with nothing left to reconnect it. */
+      const connectDeadline = setTimeout(() => {
+        if (opened) return;
+        try {
+          socket?.close();
+        } catch (e) {
+          /* nothing to close */
+        }
+        settle(new Error('ws connect timed out'));
+      }, 30000);
+
+      try {
+        socket = new WebSocket(`${WS_BASE}?t=${encodeURIComponent(ticket)}`);
+      } catch (e) {
+        return settle(e);
+      }
 
       /* Tears down a socket that is open as far as this process is concerned but
        * is carrying nothing, so onclose fires and the caller reconnects.
@@ -418,6 +457,7 @@ export class ReefAgent {
       };
 
       socket.onopen = () => {
+        opened = true;
         missed = 0;
         heartbeat = setInterval(() => {
           // Two unanswered pings, counted rather than timed: the same reasoning
@@ -445,15 +485,25 @@ export class ReefAgent {
         if (payload.type !== 'msg.new') return;
         const row = payload.message;
         if (row.mine) return;
-        if (row.seq > (this.state.seq || 0)) this.state.seq = row.seq;
-        const text = await this._textFor(row);
-        if (text === null) return; // undecryptable, or a system/profile row
-        await this.save();
-        await this.markRead([row.id]);
-        await handler({
-          id: row.id, seq: row.seq, mine: false, at: row.created_at,
-          from: row.sender_device_id, text, deleted: row.deleted,
-        }, this);
+        /* This body is async and nothing awaits it, so an throw here becomes an
+         * unhandled rejection — fatal in Node >=15, and fatal *around* the
+         * reconnect loop rather than inside it, so listenLive never sees it.
+         * Treat a failure as a bad socket instead: close it, let the catch-up
+         * read on reconnect re-deliver the message it belongs to. */
+        try {
+          if (row.seq > (this.state.seq || 0)) this.state.seq = row.seq;
+          const text = await this._textFor(row);
+          if (text === null) return; // undecryptable, or a system/profile row
+          await this.save();
+          await this.markRead([row.id]);
+          await handler({
+            id: row.id, seq: row.seq, mine: false, at: row.created_at,
+            from: row.sender_device_id, text, deleted: row.deleted,
+          }, this);
+        } catch (e) {
+          process.stderr.write(`reef: dropping socket after handler error: ${e.message}\n`);
+          giveUp();
+        }
       };
 
       socket.onerror = () => {
@@ -464,10 +514,7 @@ export class ReefAgent {
         }
       };
 
-      socket.onclose = () => {
-        clearInterval(heartbeat);
-        resolve();
-      };
+      socket.onclose = () => settle();
     });
   }
 }
@@ -531,6 +578,20 @@ function acquireLock(statePath) {
  * silently failed closed: no error, no output, exit 0, having done nothing.
  * pathToFileURL normalises either way. */
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  /* The wrapper restarts on any exit, so a crash was never fatal for long —
+   * but exit 13 (unsettled await) and a bare unhandled rejection both leave
+   * nothing in the log saying what died, which is how a listener that had been
+   * crash-looping for hours looked identical to a quiet room. Make any such
+   * failure say so and exit non-zero deliberately; the wrapper takes it from
+   * there. Installed only for the CLI, so importing this as a library does not
+   * silently hijack the host process's error handling. */
+  const fatal = (kind) => (e) => {
+    process.stderr.write(`reef: fatal ${kind}: ${(e && e.stack) || e}\n`);
+    process.exit(1);
+  };
+  process.on('unhandledRejection', fatal('unhandled rejection'));
+  process.on('uncaughtException', fatal('uncaught exception'));
+
   const args = process.argv.slice(2);
   const flag = (name, fallback) => {
     const i = args.indexOf('--' + name);
