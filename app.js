@@ -915,27 +915,38 @@
         freshUnseen++;
       }
     }
+    /* Counted before anything is added, and deliberately not from
+     * `decoded.length`. Both branches below move the window by however much the
+     * *thread* grew, which is not the same as the number of rows that arrived:
+     * ordered() drops system messages and anything hidden for this device, so a
+     * page carrying a few profile announcements grows the thread by less than
+     * its own length. This used to read the order cache while it was still
+     * stale to get a "before" figure, which happened to work only because a
+     * render had always warmed it first. */
+    const lengthBefore = ordered().length;
     decoded.forEach((m) => {
       applyProfileMessage(m);
       state.messages.set(m.id, m);
     });
     if (decoded.length) await DB.putMessages(decoded);
-    // Counted before the cache is dropped, so `tail` can be held against what
-    // arrives.
-    const lengthBefore = ordered().length;
     if (decoded.length) invalidateOrder();
+    const added = ordered().length - lengthBefore;
 
     if (prepend) {
       // Reveal what was just loaded: the window is end-relative, so a prepend
       // alone would leave the visible set unchanged.
-      state.view.count += decoded.length;
+      //
+      // Over-widening here looks harmless, since trimView caps it immediately —
+      // but it pays for the excess out of `tail`, sliding the window further
+      // back than the reader actually scrolled. Across a few pages that walks
+      // it off the front of the thread and renders nothing at all.
+      state.view.count += added;
       trimView();
     } else if (state.view.tail) {
       // Scrolled back into history, and something new has arrived at the far
       // end. `tail` counts from the newest, so leaving it alone would slide the
       // window forward under the reader — one older message dropped and one
       // newer gained, for every message the other person sends.
-      const added = ordered().length - lengthBefore;
       if (added > 0) state.view.tail += added;
     }
     renderList(prepend);
@@ -1307,6 +1318,26 @@
   const PAGE_ROWS = 40;
 
   function viewBounds(rows) {
+    /* `tail` can only be as far back as leaves a full window in front of it.
+     *
+     * Nothing enforced that. trimView turns any excess `count` into `tail`,
+     * which is right while there is still thread at the front to reveal and
+     * wrong once `start` has reached 0 — and scrolling up keeps widening either
+     * way. So `tail` walked past the beginning: first the window rendered short
+     * of its own count, then `end` reached zero and it rendered nothing at all,
+     * over a thread that was completely intact the whole time.
+     *
+     * The blank screen had no way out of itself, which is why only a reload
+     * cleared it. An empty list has nothing to scroll, so no scroll event
+     * fires, so growNewer — the one thing that ever shrinks `tail` — is never
+     * called.
+     *
+     * Clamped here rather than at the overshoot because this is the single
+     * place every render passes through, whatever route it took. Written back,
+     * so growNewer counts down from a real number rather than spending its
+     * first several pages working off an excess the reader never asked for. */
+    const room = Math.max(0, rows.length - state.view.count);
+    if (state.view.tail > room) state.view.tail = room;
     const end = Math.max(0, rows.length - state.view.tail);
     return { start: Math.max(0, end - state.view.count), end };
   }
@@ -1322,6 +1353,7 @@
   function renderList(keepAnchor) {
     const scroller = $('scroller');
     const list = $('list');
+
 
     /* Which message is at the top edge, and exactly where.
      *
@@ -1363,15 +1395,23 @@
         let last = index;
         while (last + 1 < visible.length && unreadable(visible[last + 1])) last++;
         const count = last - index + 1;
-        list.appendChild(
-          el(
-            'div',
-            'sealed',
-            count === 1
-              ? 'One earlier message cannot be opened on this device'
-              : `${count} earlier messages cannot be opened on this device`
-          )
+        const sealed = el(
+          'div',
+          'sealed',
+          count === 1
+            ? 'One earlier message cannot be opened on this device'
+            : `${count} earlier messages cannot be opened on this device`
         );
+        /* Anchorable, like any other row. This line stands in for a whole run,
+         * and without an id the scroll compensation below could not hold on to
+         * it — which mattered most in the one case where it was the *only*
+         * thing on screen. A window landing entirely inside an unopenable
+         * stretch collapses to this single line, the anchor search then found
+         * nothing, scrollTop was left pinned near the top, and every further
+         * scroll event grew the window again without ever moving the view. The
+         * window walked off the front of the thread from one flick. */
+        sealed.dataset.id = message.id;
+        list.appendChild(sealed);
         // The server keeps every envelope forever, so a run that reads as
         // broken is not necessarily gone for good — it may just be the one
         // history page that got ingested while a key was briefly missing
@@ -1537,6 +1577,12 @@
   function refreshRow(message) {
     const rows = $('list').children;
     for (let i = 0; i < rows.length; i++) {
+      // A collapsed run carries the id of its first message so the scroll
+      // anchor can hold on to it, but it stands for many messages and is not a
+      // row. Swapping it for a single bubble would drop the rest of the run off
+      // the screen, so leave it to the full render below, which is the only
+      // thing that can work out what the run should now look like.
+      if (rows[i].classList.contains('sealed')) continue;
       if (rows[i].dataset && rows[i].dataset.id === message.id) {
         rows[i].replaceWith(
           renderRow(message, rows[i]._shape || { grouped: false, tail: true })
@@ -4957,16 +5003,27 @@
    * next page comes from the server. */
   async function growOlder() {
     if (growing) return;
-    const rows = ordered();
-    if (viewBounds(rows).start === 0) {
-      growing = true;
-      await loadOlder();
-      growing = false;
-      return;
+    growing = true;
+    try {
+      const rows = ordered();
+      if (viewBounds(rows).start === 0) {
+        await loadOlder();
+        return;
+      }
+      state.view.count += PAGE_ROWS;
+      trimView();
+      renderList(true);
+    } finally {
+      /* The guard now covers widening too, and is released a frame later rather
+       * than at once. Only the server fetch was ever guarded, so a touch fling
+       * — which emits scroll events far faster than the layout reacting to them
+       * can settle — widened the window dozens of times before the reader saw
+       * any of it, arriving hundreds of messages back from a single flick. One
+       * page per frame keeps the growth tied to what is actually on screen. */
+      requestAnimationFrame(() => {
+        growing = false;
+      });
     }
-    state.view.count += PAGE_ROWS;
-    trimView();
-    renderList(true);
   }
 
   /* Newer, on scrolling back down. Only reachable when the cap has pushed the
