@@ -6,3 +6,6 @@ agent/*.stop
 # Wrapper supervisor pid, written next to the state file. Named
 # <state>.wrapper.pid, so it does not match agent/*.json above.
 agent/*.pid
+# Cross-session reply claims (see claim-message.sh) — one dir per message id,
+# purely local coordination, never meaningful to commit.
+agent/*.claims/
