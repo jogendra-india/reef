@@ -6,3 +6,6 @@ agent/*.stop
 # Wrapper supervisor pid, written next to the state file. Named
 # <state>.wrapper.pid, so it does not match agent/*.json above.
 agent/*.pid
+# Decrypted attachments, written locally by `read`/`listen` -- plaintext of
+# whatever was sent, never belongs in the repo.
+agent/attachments/
