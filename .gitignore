@@ -9,3 +9,6 @@ agent/*.pid
 # Decrypted attachments, written locally by `read`/`listen` -- plaintext of
 # whatever was sent, never belongs in the repo.
 agent/attachments/
+# Cross-session reply claims (see claim-message.sh) — one dir per message id,
+# purely local coordination, never meaningful to commit.
+agent/*.claims/
