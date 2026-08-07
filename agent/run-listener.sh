@@ -35,6 +35,24 @@ if [ -z "$STATE" ]; then
 fi
 STOP_FILE="${STATE}.stop"
 WRAPPER_PID_FILE="${STATE}.wrapper.pid"
+
+# One wrapper per state file. A second chat session following the setup steps
+# runs this again, and without this check the newcomer overwrote
+# WRAPPER_PID_FILE with its own pid — pointing stop-listener.sh at the
+# redundant wrapper and leaving the real one unreachable by file — then
+# crash-looped every 3s because the live listener still holds the lock. Exit 0,
+# not an error: the desired end state (a listener is running for this state
+# file) is already true, so this is a no-op, and a fresh chat can safely run
+# the launch command without checking first.
+if [ -f "$WRAPPER_PID_FILE" ]; then
+  existing="$(tr -d '[:space:]' < "$WRAPPER_PID_FILE" 2>/dev/null)"
+  if [ -n "$existing" ] && kill -0 "$existing" 2>/dev/null; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [wrapper] already running for $STATE (pid $existing), nothing to do" >> agent/listen.log
+    echo "listener already running for $STATE (wrapper pid $existing)"
+    exit 0
+  fi
+fi
+
 rm -f "$STOP_FILE"
 
 # Published so a deliberate stop has one discoverable thing to signal, instead
@@ -43,6 +61,8 @@ echo "$$" > "$WRAPPER_PID_FILE"
 
 child=""
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [wrapper] $1" >> agent/listen.log; }
+
+export PATH="$HOME/.nvm/versions/node/$(ls ~/.nvm/versions/node 2>/dev/null | tail -1)/bin:$PATH"
 
 # A signal aimed at the wrapper is deliberate by construction: nothing restarts
 # the wrapper, so there is no accidental-kill case to defend against at this
@@ -74,6 +94,23 @@ while true; do
   if [ -f "$STOP_FILE" ]; then
     log "stop file present, exiting (last code $code)"
     rm -f "$STOP_FILE" "$WRAPPER_PID_FILE"
+    exit 0
+  fi
+  # 12 = LOCK_CONFLICT_EXIT in reef-agent.mjs: another listener holds the lock
+  # and is alive. Restarting cannot resolve that, it just reprints the refusal
+  # every 3s — the whole point of this loop is undoing *accidental* deaths, and
+  # this is a deliberate refusal. Leave the pid file alone: it belongs to
+  # whichever wrapper is actually supervising the live listener.
+  if [ "$code" -eq 12 ]; then
+    log "another listener owns the lock, exiting without restart"
+    # Reached when the pid file was stale/absent at startup (so the guard above
+    # let this wrapper through) but a listener was in fact alive. This wrapper
+    # has since published its own pid; leaving it behind on the way out would
+    # point stop-listener.sh at a dead process. Absent is recoverable — the
+    # lock file still names the live listener — a wrong pid is not.
+    if [ "$(tr -d '[:space:]' < "$WRAPPER_PID_FILE" 2>/dev/null)" = "$$" ]; then
+      rm -f "$WRAPPER_PID_FILE"
+    fi
     exit 0
   fi
   log "listen exited (code $code), restarting in 3s"

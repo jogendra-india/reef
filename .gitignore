@@ -12,3 +12,8 @@ agent/attachments/
 # Cross-session reply claims (see claim-message.sh) — one dir per message id,
 # purely local coordination, never meaningful to commit.
 agent/*.claims/
+# Per-session inboxes (see inbox.sh): decrypted message text, one file per
+# chat session that has owned the room. Same reason attachments/ is ignored.
+agent/inbox/
+# Which chat session currently owns the room. Machine-local by definition.
+agent/*.owner

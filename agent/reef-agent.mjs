@@ -27,7 +27,7 @@
 
 import { webcrypto as crypto } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
@@ -585,6 +585,16 @@ export class ReefAgent {
  * start if another `listen` for the same state file is already alive, and
  * cleans a stale lock left by a process that died without removing it.
  */
+/* A lock conflict is the one failure here that retrying can never fix: the
+ * other listener is alive and staying alive, so a supervisor that treats this
+ * like a crash restarts into the same refusal every few seconds forever. That
+ * happened live — a second chat launched its own `run-listener.sh`, and the
+ * resulting loop wrote a stack trace to listen.log every 3s, which is exactly
+ * the flood that gets a monitor auto-suppressed and costs the *working*
+ * session its crash visibility. Given its own exit code so the wrapper can
+ * tell "someone else has this" from "I died, restart me". */
+export const LOCK_CONFLICT_EXIT = 12;
+
 function lockPathFor(statePath) {
   return statePath + '.lock';
 }
@@ -602,11 +612,15 @@ function acquireLock(statePath) {
       }
     })();
     if (alive) {
-      throw new Error(
+      // Thrown rather than exited, so importing this as a library still gets an
+      // error to handle; the CLI's fatal handler turns the tag into the code.
+      const conflict = new Error(
         `Another 'listen' is already running for ${statePath} (pid ${pid}). ` +
         `Two listeners on the same identity double-act on every message — stop ` +
         `that one first (or use a different --state) rather than running both.`
       );
+      conflict.exitCode = LOCK_CONFLICT_EXIT;
+      throw conflict;
     }
   }
   writeFileSync(lockPath, String(process.pid));
@@ -620,6 +634,70 @@ function acquireLock(statePath) {
   process.on('exit', release);
   process.on('SIGINT', () => process.exit(130));
   process.on('SIGTERM', () => process.exit(143));
+}
+
+/* --- session-addressed delivery -----------------------------------------
+ *
+ * `listen.log` was a broadcast bus. One listener process writes it, but any
+ * number of readers tail it, so a second chat session told "go reef way"
+ * started getting notified about a conversation the first one was already
+ * holding: every session woke an LLM turn for every message, and which one
+ * actually replied was decided by whichever `claim-message.sh` call happened
+ * to land first. Claiming keeps the *reply* single, but only after every
+ * session has already been woken, and "whoever raced fastest" is the wrong
+ * answer anyway — the session the operator is currently looking at should be
+ * the one that answers.
+ *
+ * So each message is addressed when it is written instead of being sorted out
+ * afterwards. Exactly one session owns the conversation; its id lives in
+ * `<state>.owner`, last writer wins, which is what lets a freshly opened chat
+ * take over. Each incoming message is appended to that owner's own file under
+ * `agent/inbox/`, so only the owner's tail ever sees it — nothing else has to
+ * agree, or race, or be told to stand down.
+ *
+ * stdout (hence `listen.log`) keeps only an audit line naming the message id
+ * and the inbox it went to, deliberately *without* the REEF_MSG token: a
+ * monitor still running from an older session, grepping listen.log for
+ * REEF_MSG, therefore goes quiet as soon as this ships instead of needing that
+ * session to be restarted. It also keeps message text out of the shared log.
+ */
+const INBOX_DIR = fileURLToPath(new URL('inbox/', import.meta.url));
+const UNOWNED_INBOX = 'unowned';
+
+export function ownerPathFor(statePath) {
+  return statePath + '.owner';
+}
+
+/* An owner id arrives from a file on disk and becomes a filename, so it is
+ * whitelisted rather than trusted: anything outside the usual id characters is
+ * a corrupt (or hostile) owner file, and is treated as nobody owning the room
+ * rather than as a path to write to. */
+function sanitizeOwner(raw) {
+  const owner = String(raw || '').trim();
+  return /^[A-Za-z0-9._-]{1,128}$/.test(owner) ? owner : UNOWNED_INBOX;
+}
+
+export function currentOwner(statePath) {
+  try {
+    const path = ownerPathFor(statePath);
+    return existsSync(path) ? sanitizeOwner(readFileSync(path, 'utf8')) : UNOWNED_INBOX;
+  } catch (e) {
+    return UNOWNED_INBOX;
+  }
+}
+
+/* Returns the owner it delivered to, for the caller's audit line. A failed
+ * write must not take the listener down — the socket and the room are fine,
+ * only this one append isn't — so it degrades to stderr and carries on. */
+export function deliverToInbox(statePath, line) {
+  const owner = currentOwner(statePath);
+  try {
+    if (!existsSync(INBOX_DIR)) mkdirSync(INBOX_DIR, { recursive: true });
+    appendFileSync(join(INBOX_DIR, `${owner}.log`), line + '\n');
+  } catch (e) {
+    process.stderr.write(`reef: could not write inbox for ${owner}: ${e.message}\n`);
+  }
+  return owner;
 }
 
 /* --- CLI ---------------------------------------------------------------- */
@@ -638,6 +716,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
    * there. Installed only for the CLI, so importing this as a library does not
    * silently hijack the host process's error handling. */
   const fatal = (kind) => (e) => {
+    // A tagged exitCode means the failure is deterministic and the caller is
+    // meant to act on which one it was (see LOCK_CONFLICT_EXIT); everything
+    // else is a plain 1 for "died, restarting is reasonable". A lock conflict
+    // also prints just its message: the stack is noise for a condition whose
+    // fix is "stop the other listener", and it was being written to the shared
+    // log every 3s.
+    if (e && e.exitCode === LOCK_CONFLICT_EXIT) {
+      process.stderr.write(`reef: ${e.message}\n`);
+      process.exit(e.exitCode);
+    }
     process.stderr.write(`reef: fatal ${kind}: ${(e && e.stack) || e}\n`);
     process.exit(1);
   };
@@ -691,10 +779,15 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     });
   } else if (command === 'listen') {
     // Push, not poll, and never replies on its own — this is the half meant
-    // to sit behind Monitor: one clean stdout line per real incoming
-    // message, and nothing else, so the decision to wake an LLM turn is "did
-    // a line print", not a schedule. Replying is a separate, deliberate
-    // `send` call from whoever reads that line.
+    // to sit behind Monitor: one clean line per real incoming message, and
+    // nothing else, so the decision to wake an LLM turn is "did a line
+    // print", not a schedule. Replying is a separate, deliberate `send` call
+    // from whoever reads that line.
+    //
+    // That line goes to the owning session's inbox file rather than stdout
+    // (see "session-addressed delivery" above), so only the session that
+    // currently owns the conversation is woken by it. stdout keeps the audit
+    // trail: which message went to which inbox, no message text.
     //
     // Locked so a second `listen` on the same --state refuses to start
     // instead of silently double-acting on every message alongside the
@@ -702,7 +795,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     acquireLock(agent.statePath);
     console.log(`listening on room ${agent.roomId}`);
     await agent.listenLive(async (message) => {
-      console.log(`REEF_MSG ${JSON.stringify({ id: message.id, from: message.from, at: message.at, text: message.text, attachments: message.attachments || [] })}`);
+      const payload = JSON.stringify({ id: message.id, from: message.from, at: message.at, text: message.text, attachments: message.attachments || [] });
+      const owner = deliverToInbox(agent.statePath, `REEF_MSG ${payload}`);
+      console.log(`msg ${message.id} -> inbox ${owner}`);
     });
   } else {
     console.error('Commands: whoami | send <text> | read | watch | listen');
