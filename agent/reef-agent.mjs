@@ -546,6 +546,16 @@ export class ReefAgent {
         opened = true;
         missed = 0;
         heartbeat = setInterval(() => {
+          // Printed every tick, before anything else, regardless of ping
+          // outcome: this is what lets an external watchdog (run-listener.sh)
+          // tell a frozen event loop from a merely quiet room. The ping/pong
+          // check below only works if the event loop is running at all to
+          // execute it — if the whole process gets suspended (observed: hours
+          // of total silence, socket included, from a child that never exited
+          // and so was never restarted), nothing inside this process can
+          // notice its own freeze. A line here on a fixed cadence, watched
+          // for staleness from outside, can.
+          console.log(`${new Date().toISOString()} heartbeat`);
           // Two unanswered pings, counted rather than timed: the same reasoning
           // as the browser client, where a throttled timer makes any wall-clock
           // deadline lie about a healthy socket.

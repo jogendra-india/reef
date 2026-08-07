@@ -36,6 +36,15 @@ fi
 STOP_FILE="${STATE}.stop"
 WRAPPER_PID_FILE="${STATE}.wrapper.pid"
 
+# How long listen.log may go untouched before the watchdog below decides the
+# child is frozen rather than just connected to a quiet room. Must clear the
+# worst *legitimate* gap: two missed pings (~40s) + giveUp + jittered backoff
+# (up to ~40s) + a fresh connect (up to the 30s connect deadline) + one
+# heartbeat tick (20s) before the first post-reconnect line lands -- under
+# 150s in practice, so 240s leaves real margin without leaving a freeze
+# undetected for anywhere near as long as it can currently go unnoticed.
+STALE_SECS=240
+
 # One wrapper per state file. A second chat session following the setup steps
 # runs this again, and without this check the newcomer overwrote
 # WRAPPER_PID_FILE with its own pid — pointing stop-listener.sh at the
@@ -60,6 +69,7 @@ rm -f "$STOP_FILE"
 echo "$$" > "$WRAPPER_PID_FILE"
 
 child=""
+watchdog=""
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [wrapper] $1" >> agent/listen.log; }
 
 export PATH="$HOME/.nvm/versions/node/$(ls ~/.nvm/versions/node 2>/dev/null | tail -1)/bin:$PATH"
@@ -70,6 +80,9 @@ export PATH="$HOME/.nvm/versions/node/$(ls ~/.nvm/versions/node 2>/dev/null | ta
 shutdown() {
   trap - TERM INT
   log "stop signal received, shutting down without restart"
+  if [ -n "$watchdog" ]; then
+    kill "$watchdog" 2>/dev/null || true
+  fi
   if [ -n "$child" ]; then
     kill "$child" 2>/dev/null || true
     wait "$child" 2>/dev/null || true
@@ -84,12 +97,40 @@ log "wrapper started (pid $$) for $STATE"
 while true; do
   node --use-system-ca agent/reef-agent.mjs --state "$STATE" --label "Claude-agent" listen >> agent/listen.log 2>&1 &
   child=$!
+
+  # External staleness watchdog. reef-agent.mjs prints a heartbeat line to
+  # listen.log every 20s while a socket is open specifically so this can
+  # exist: the in-process ping/pong check can only fire if the event loop is
+  # still running to execute it, so it cannot catch the process itself
+  # stalling -- observed live as a child that never exited, and so was never
+  # restarted, silent (no heartbeat, no real incoming messages logged either)
+  # for the better part of an hour. This polls from outside instead and kills
+  # the child if it stops writing; the crash-loop restart just below already
+  # knows how to recover from that, same as any other exit.
+  (
+    trap - TERM INT
+    while kill -0 "$child" 2>/dev/null; do
+      sleep 30
+      kill -0 "$child" 2>/dev/null || break
+      last="$(stat -c %Y agent/listen.log 2>/dev/null || echo 0)"
+      now="$(date +%s)"
+      if [ $((now - last)) -gt "$STALE_SECS" ]; then
+        log "listen.log stale for ${STALE_SECS}s+, child pid $child looks frozen -- killing it"
+        kill "$child" 2>/dev/null
+        break
+      fi
+    done
+  ) &
+  watchdog=$!
+
   # `wait` rather than a foreground child, so the trap can fire while the child
   # is still running. A foreground child would delay the signal until it exited
   # on its own, which for a healthy listener is never.
   wait "$child"
   code=$?
   child=""
+  kill "$watchdog" 2>/dev/null
+  watchdog=""
 
   if [ -f "$STOP_FILE" ]; then
     log "stop file present, exiting (last code $code)"
