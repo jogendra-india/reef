@@ -33,7 +33,7 @@ import { join } from 'node:path';
 
 /* A PIN typed after --pin sits in shell history and in `ps aux` for anyone
  * else on the machine to read. `agent/.env` (gitignored, never committed) is
- * the alternative: `REEF_PIN=333023` there is picked up automatically,
+ * the alternative: `REEF_PIN=<your pin>` there is picked up automatically,
  * nothing to pass on the command line at all. Real environment variables
  * still win over the file, same as every other dotenv convention — this is
  * only a floor, not an override. Co-located with the script, not the cwd, so
@@ -158,6 +158,11 @@ async function request(path, { method = 'GET', token, json } = {}) {
   if (!response.ok) {
     const err = new Error(body.detail || `${method} ${path} -> ${response.status}`);
     err.status = response.status;
+    // The machine-readable half of the error, not just the sentence: a caller
+    // deciding whether a failure is worth retrying cannot do it by matching on
+    // `detail` text, and everything past `status` was being thrown away.
+    err.code = body.code;
+    err.body = body;
     throw err;
   }
   return body;
@@ -273,20 +278,42 @@ export class ReefAgent {
     if (!this.recipients.length) throw new Error('Nobody is in this conversation yet.');
     const id = crypto.randomUUID();
     const body = { v: 1, type: 'text', text, ...extra };
-    const envelopes = [];
-    for (const r of this.recipients) {
-      envelopes.push({
-        device_id: r.id,
-        ...(await seal(this.pairKeys.get(String(r.id)), body, {
-          messageId: id, senderDeviceId: this.deviceId, recipientDeviceId: r.id,
-        })),
+
+    const sealAll = async () => {
+      const envelopes = [];
+      for (const r of this.recipients) {
+        envelopes.push({
+          device_id: r.id,
+          ...(await seal(this.pairKeys.get(String(r.id)), body, {
+            messageId: id, senderDeviceId: this.deviceId, recipientDeviceId: r.id,
+          })),
+        });
+      }
+      // The id is the idempotency key: retrying a send cannot duplicate it,
+      // which is what makes the retry below safe even if the first attempt
+      // reached the server.
+      return request('/entries/', {
+        method: 'POST', token: this.token,
+        json: { id, kind: 'text', reply_to: null, envelopes, attachment_ids: [] },
       });
+    };
+
+    let result;
+    try {
+      result = await sealAll();
+    } catch (e) {
+      /* The server insists the envelope set exactly matches the room's current
+       * active devices, so a cached recipient list stops being valid the moment
+       * anyone's phone joins or is retired — and every send fails until the list
+       * is refetched. Nothing announced that, so the message just would not go:
+       * observed live as "Envelopes must cover exactly the active recipients."
+       * on every attempt from a device that had been up for minutes. Refetch and
+       * re-seal once; a second failure is a real one. */
+      if (e.code !== 'recipients_changed') throw e;
+      await this.refreshKeys();
+      if (!this.recipients.length) throw new Error('Nobody is in this conversation yet.');
+      result = await sealAll();
     }
-    // The id is the idempotency key: retrying a send cannot duplicate it.
-    const result = await request('/entries/', {
-      method: 'POST', token: this.token,
-      json: { id, kind: 'text', reply_to: null, envelopes, attachment_ids: [] },
-    });
 
     // An envelope is sealed for each *recipient*, so nothing on the server is
     // addressed to the sender — reading your own message back is not possible
@@ -306,11 +333,18 @@ export class ReefAgent {
    * paths, already downloaded and decrypted here, so nothing downstream ever
    * has to touch ciphertext or blob ids directly. */
   async _contentFor(row) {
-    if (row.mine) {
-      // Ours: no envelope exists for us, so the local copy is the only source.
+    /* `mine` is true for the whole *seat*, not just this device, so it cannot
+     * stand in for "there is no envelope for me". A second device on the same
+     * seat is a recipient like any other — `recipient_devices()` seals for it
+     * precisely so the other phone can read what was sent — and taking the
+     * local-copy branch on `mine` alone threw that envelope away and rendered
+     * the message blank. Only this device's own sends have no envelope, and the
+     * presence of `row.envelope` says so more reliably than any flag. */
+    if (!row.envelope) {
+      // Nothing addressed to us: our own send (local copy is the only source),
+      // or a message from before this device existed (nothing to show).
       return { text: (this.state.sent || {})[row.id] ?? null, attachments: [] };
     }
-    if (!row.envelope) return { text: null, attachments: [] };
     const key = this.pairKeys.get(String(row.sender_device_id));
     if (!key) return { text: null, attachments: [] };
     let body;
