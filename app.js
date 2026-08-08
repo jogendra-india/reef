@@ -5129,45 +5129,53 @@
       onFiles(event.target.files);
       event.target.value = '';
     });
-    // Pasting a screenshot or a copied file straight into the composer —
-    // clipboardData.files is only populated for actual file/image data, so
-    // pasting text is untouched.
-    $('text').addEventListener('paste', (event) => {
+    // Pasting a screenshot or a copied file. Bound to the document rather than
+    // the textarea: a file copied in the OS gets pasted with Ctrl+V on arrival,
+    // without clicking into the box first, and a listener on #text only ever
+    // hears it while #text has focus — which is why binding it there did
+    // nothing. clipboardData.files is empty for text, so an ordinary paste
+    // falls through untouched wherever it lands.
+    document.addEventListener('paste', (event) => {
+      if (!$('pool').classList.contains('on')) return;
       const files = event.clipboardData && event.clipboardData.files;
-      if (files && files.length) {
-        event.preventDefault();
-        onFiles(files);
-      }
+      if (!files || !files.length) return;
+      event.preventDefault();
+      onFiles(files);
     });
-    // Drag-and-drop over the whole thread, not just the input row — dragenter/
-    // dragleave fire per child element as the pointer crosses them, so a depth
-    // counter is needed to know when the pointer has actually left #pool.
+    // Drag-and-drop, also on the document rather than #pool. A drop that lands
+    // even slightly outside the thread would otherwise hit the browser default
+    // and navigate the tab to the dropped file, losing whatever was composed —
+    // so every file drop is swallowed here, and only acted on over the chat.
+    // dragenter/dragleave fire once per element crossed, so a depth counter is
+    // what distinguishes moving between children from leaving altogether.
     (() => {
-      const pool = $('pool');
       const overlay = $('drag-overlay');
       let dragDepth = 0;
-      const hasFiles = (event) => event.dataTransfer && [...event.dataTransfer.types].includes('Files');
-      pool.addEventListener('dragenter', (event) => {
-        if (!hasFiles(event)) return;
+      const carriesFiles = (event) =>
+        !!event.dataTransfer && [...event.dataTransfer.types].includes('Files');
+      const onChat = () => $('pool').classList.contains('on');
+      document.addEventListener('dragenter', (event) => {
+        if (!carriesFiles(event)) return;
         event.preventDefault();
         dragDepth++;
-        overlay.classList.add('on');
+        if (onChat()) overlay.classList.add('on');
       });
-      pool.addEventListener('dragover', (event) => {
-        if (!hasFiles(event)) return;
+      // Without preventDefault here the drop event never fires at all.
+      document.addEventListener('dragover', (event) => {
+        if (!carriesFiles(event)) return;
         event.preventDefault();
       });
-      pool.addEventListener('dragleave', (event) => {
-        if (!hasFiles(event)) return;
+      document.addEventListener('dragleave', (event) => {
+        if (!carriesFiles(event)) return;
         dragDepth = Math.max(0, dragDepth - 1);
         if (dragDepth === 0) overlay.classList.remove('on');
       });
-      pool.addEventListener('drop', (event) => {
-        if (!hasFiles(event)) return;
+      document.addEventListener('drop', (event) => {
+        if (!carriesFiles(event)) return;
         event.preventDefault();
         dragDepth = 0;
         overlay.classList.remove('on');
-        onFiles(event.dataTransfer.files);
+        if (onChat()) onFiles(event.dataTransfer.files);
       });
     })();
     $('reply-cancel').addEventListener('click', clearReply);

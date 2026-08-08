@@ -245,8 +245,14 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 #match-bar button:disabled{opacity:.3;}
 #match-bar button:not(:disabled):active{background:var(--surface-2);}
 .inputrow{display:flex;align-items:flex-end;gap:4px;}
+/* The buttons keep their size; only the textarea gives ground. */
+.inputrow .tap{flex:0 0 auto;}
+/* min-width:0 is load-bearing. A textarea carries an intrinsic width from its
+   default `cols`, and a flex item will not shrink below that on its own —
+   Firefox honours it strictly, so the row overflowed and carried #send off
+   the right edge of a narrow screen. */
 #text{
-  flex:1;resize:none;border:0;outline:0;background:var(--surface);
+  flex:1;min-width:0;resize:none;border:0;outline:0;background:var(--surface);
   border-radius:20px;padding:11px 14px;max-height:132px;min-height:44px;line-height:1.35;
 }
 #text::placeholder{color:#5d7d87;}
