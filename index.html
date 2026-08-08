@@ -176,6 +176,15 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .file span{display:block;font-size:12px;opacity:.75;}
 
+/* Whole-screen drop target: a dropped file can land anywhere over the
+   thread, not just precisely on the composer. */
+#pool{position:relative;}
+#drag-overlay{position:absolute;inset:0;display:none;align-items:center;
+              justify-content:center;background:#0009;color:#fff;
+              font-size:16px;font-weight:600;border:2px dashed var(--accent);
+              z-index:50;pointer-events:none;}
+#drag-overlay.on{display:flex;}
+
 /* Staged attachments — what is about to go, and a way to change your mind. */
 #staged{display:none;gap:6px;margin:2px 4px 6px;padding-bottom:2px;
         overflow-x:auto;overscroll-behavior-x:contain;}
@@ -407,6 +416,7 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
   </section>
 
   <section id="pool" class="screen">
+    <div id="drag-overlay">Drop to attach</div>
     <header id="hdr">
       <div class="avatar" id="peer-avatar">🐟</div>
       <div class="who">

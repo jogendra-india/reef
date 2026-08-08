@@ -5129,6 +5129,47 @@
       onFiles(event.target.files);
       event.target.value = '';
     });
+    // Pasting a screenshot or a copied file straight into the composer —
+    // clipboardData.files is only populated for actual file/image data, so
+    // pasting text is untouched.
+    $('text').addEventListener('paste', (event) => {
+      const files = event.clipboardData && event.clipboardData.files;
+      if (files && files.length) {
+        event.preventDefault();
+        onFiles(files);
+      }
+    });
+    // Drag-and-drop over the whole thread, not just the input row — dragenter/
+    // dragleave fire per child element as the pointer crosses them, so a depth
+    // counter is needed to know when the pointer has actually left #pool.
+    (() => {
+      const pool = $('pool');
+      const overlay = $('drag-overlay');
+      let dragDepth = 0;
+      const hasFiles = (event) => event.dataTransfer && [...event.dataTransfer.types].includes('Files');
+      pool.addEventListener('dragenter', (event) => {
+        if (!hasFiles(event)) return;
+        event.preventDefault();
+        dragDepth++;
+        overlay.classList.add('on');
+      });
+      pool.addEventListener('dragover', (event) => {
+        if (!hasFiles(event)) return;
+        event.preventDefault();
+      });
+      pool.addEventListener('dragleave', (event) => {
+        if (!hasFiles(event)) return;
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth === 0) overlay.classList.remove('on');
+      });
+      pool.addEventListener('drop', (event) => {
+        if (!hasFiles(event)) return;
+        event.preventDefault();
+        dragDepth = 0;
+        overlay.classList.remove('on');
+        onFiles(event.dataTransfer.files);
+      });
+    })();
     $('reply-cancel').addEventListener('click', clearReply);
     $('edit-cancel').addEventListener('click', cancelEdit);
     $('select-cancel').addEventListener('click', exitSelectMode);
