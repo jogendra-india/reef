@@ -345,8 +345,23 @@ export class ReefAgent {
       // or a message from before this device existed (nothing to show).
       return { text: (this.state.sent || {})[row.id] ?? null, attachments: [] };
     }
-    const key = this.pairKeys.get(String(row.sender_device_id));
-    if (!key) return { text: null, attachments: [] };
+    let key = this.pairKeys.get(String(row.sender_device_id));
+    if (!key) {
+      /* `pairKeys` is only ever populated at connect() -- a long-lived
+       * `listen` process never calls refreshKeys() again on its own, so a
+       * device that becomes active on the other seat *after* we connected
+       * (a new phone, a browser re-enrolling) is invisible to us until
+       * something forces a refresh. Observed live: a message from such a
+       * device silently vanished with no error and no log line, because the
+       * caller only sees `text: null` and treats that as "nothing to show"
+       * -- indistinguishable from a message that legitimately isn't for us.
+       * One retry here is enough: it's the same "stale cache" situation
+       * send()'s recipient-mismatch retry already handles for our own
+       * sends, just triggered by reading instead of writing. */
+      await this.refreshKeys();
+      key = this.pairKeys.get(String(row.sender_device_id));
+      if (!key) return { text: null, attachments: [] };
+    }
     let body;
     try {
       body = await open(key, row.envelope, {
