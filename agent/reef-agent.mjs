@@ -820,7 +820,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       safety_number: agent.safetyNumber,
     }, null, 2));
   } else if (command === 'send') {
-    await agent.send(rest.join(' '));
+    // Argv has no way to carry a real newline — a multi-line reply arrives as
+    // the literal two characters `\n`, and without this it goes out (and
+    // renders) exactly like that instead of a line break.
+    const text = rest.join(' ').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    await agent.send(text);
     console.log('sent');
   } else if (command === 'read') {
     for (const m of await agent.read()) {
