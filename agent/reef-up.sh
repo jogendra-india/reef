@@ -109,13 +109,21 @@ WRAPPER_PID_FILE="${STATE}.wrapper.pid"
 OWNER_FILE="${STATE}.owner"
 
 # `kill -0` is the portable existence check and works for native processes under
-# Git Bash too (it maps to OpenProcess, unlike -STOP which MSYS silently drops).
-# `ps -W` is the fallback for the case where MSYS refuses a win32 pid.
+# Git Bash too (it maps to OpenProcess, unlike -STOP which MSYS silently drops)
+# -- but only when given the MSYS-translated pid. A pid written by a *native*
+# win32 process (node's own `process.pid`, as the listener writes to its lock
+# file) is the real Windows PID instead, which `kill -0` rejects outright
+# ("No such process") even though the process is very much alive. `ps -W` is
+# the fallback for that case -- but its own columns mix both pid flavors (col
+# 1 is the MSYS pid, col 4 is the WINPID: for a bash process, like the
+# wrapper, those differ; for a native process, like the listener, col 4 is
+# the one that matches what's in the pid file). Check both columns rather
+# than assume which one a given pid file holds.
 pid_alive() {
   local pid="$1"
   [ -n "$pid" ] || return 1
   kill -0 "$pid" 2>/dev/null && return 0
-  ps -W 2>/dev/null | awk -v p="$pid" '$1 == p { found = 1 } END { exit !found }' && return 0
+  ps -W 2>/dev/null | awk -v p="$pid" '($1 == p) || ($4 == p) { found = 1 } END { exit !found }' && return 0
   return 1
 }
 # -f guard, not just `2>/dev/null` on tr: a missing file makes the *shell*
