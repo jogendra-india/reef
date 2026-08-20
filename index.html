@@ -247,15 +247,20 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .inputrow{display:flex;align-items:flex-end;gap:4px;}
 /* The buttons keep their size; only the textarea gives ground. */
 .inputrow .tap{flex:0 0 auto;}
-/* min-width:0 is load-bearing. A textarea carries an intrinsic width from its
+/* min-width:0 is load-bearing. A textarea carried an intrinsic width from its
    default `cols`, and a flex item will not shrink below that on its own —
    Firefox honours it strictly, so the row overflowed and carried #send off
-   the right edge of a narrow screen. */
+   the right edge of a narrow screen. #text is a contenteditable div now (see
+   app.js), not an <input>, so the same min-width:0 fix still applies. */
 #text{
-  flex:1;min-width:0;resize:none;border:0;outline:0;background:var(--surface);
+  flex:1;min-width:0;border:0;outline:0;background:var(--surface);
   border-radius:20px;padding:11px 14px;max-height:132px;min-height:44px;line-height:1.35;
+  overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;
 }
-#text::placeholder{color:#5d7d87;}
+/* Growth is plain CSS now (min/max-height + overflow), not JS measuring
+   scrollHeight — a div's intrinsic height already tracks its content, which a
+   textarea's did not. */
+#text:empty::before{content:attr(data-placeholder);color:#5d7d87;pointer-events:none;}
 #send{width:48px;height:48px;border-radius:50%;background:var(--accent);color:var(--accent-ink);
       display:flex;align-items:center;justify-content:center;font-size:20px;flex:0 0 auto;}
 #send:disabled{opacity:.45;}
@@ -500,8 +505,16 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 
       <div class="inputrow" id="inputrow">
         <button class="tap" id="attach" aria-label="Attach">＋</button>
-        <textarea id="text" rows="1" placeholder="Say something…"
-                  enterkeyhint="send" autocomplete="off" autocorrect="on"></textarea>
+        <!-- contenteditable, not a textarea: Chrome only offers Gboard's GIF/
+             sticker keyboard (InputConnection#commitContent) to editable
+             elements, never to <textarea>/<input> — see app.js paste handler.
+             plaintext-only keeps it behaving like a plain multi-line field
+             (no pasted-in rich formatting, Enter -> literal newline) rather
+             than a rich-text editor; unsupported browsers fall back to plain
+             contenteditable and the paste handler covers the gap. -->
+        <div id="text" contenteditable="plaintext-only" role="textbox"
+             aria-multiline="true" aria-label="Message" data-placeholder="Say something…"
+             enterkeyhint="send" autocorrect="on"></div>
         <button class="tap" id="emoji-btn" aria-label="Emoji">☺</button>
         <button id="send" aria-label="Send" disabled>➤</button>
       </div>

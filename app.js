@@ -2382,11 +2382,21 @@
    * Composing
    * ==================================================================== */
 
+  // #text is contenteditable, not a <textarea> — .value doesn't exist. Read
+  // through .innerText, not .textContent: textContent ignores <br> entirely
+  // (line breaks vanish), while innerText is the layout-aware rendering that
+  // turns them back into '\n', matching what a textarea's .value gave us.
+  const textOf = (box) => box.innerText;
+  const setTextOf = (box, text) => {
+    box.innerText = text;
+  };
+
   function autogrow() {
     const box = $('text');
-    box.style.height = 'auto';
-    box.style.height = Math.min(box.scrollHeight, 132) + 'px';
-    const hasContent = box.value.trim() || pendingFiles.length;
+    // Growth up to max-height is plain CSS now (see index.html) — a
+    // contenteditable div's intrinsic height already tracks its content,
+    // unlike a textarea's, so there is nothing left to measure here.
+    const hasContent = textOf(box).trim() || pendingFiles.length;
     // With nobody active on the other side there is no envelope to address, so
     // the send would be rejected by the server. It used to render optimistically
     // and then fail quietly, which reads exactly like a message that went
@@ -2410,7 +2420,7 @@
       strip.style.cursor = elsewhere ? 'pointer' : '';
       strip.onclick = elsewhere ? openRoomSheet : null;
     }
-    $('text').placeholder = missing
+    $('text').dataset.placeholder = missing
       ? 'Nobody to talk to yet'
       : 'Say something…';
     autogrow();
@@ -2423,7 +2433,7 @@
     if (!state.stream) return;
     // Clearing the box says so. Only `true` was ever sent, so the other side
     // sat on "blowing bubbles…" until its own four-second timeout expired.
-    if (!$('text').value.trim()) return stopTyping();
+    if (!textOf($('text')).trim()) return stopTyping();
     const now = Date.now();
     if (now - typingSent > 2000) {
       typingSent = now;
@@ -2441,7 +2451,7 @@
   function saveDraft() {
     clearTimeout(draftTimer);
     draftTimer = setTimeout(
-      () => DB.put(DB.STORES.settings, $('text').value, 'draft'),
+      () => DB.put(DB.STORES.settings, textOf($('text')), 'draft'),
       300
     );
   }
@@ -2465,7 +2475,7 @@
 
   async function onSend() {
     const box = $('text');
-    const text = box.value.trim();
+    const text = textOf(box).trim();
     if (!text && !pendingFiles.length) return;
 
     if (state.editing) return commitEdit(text);
@@ -2474,7 +2484,7 @@
     const body = { v: 1, type: pendingFiles.length ? 'media' : 'text', text };
     const files = pendingFiles;
     clearStaged();
-    box.value = '';
+    setTextOf(box, '');
     autogrow();
     stopTyping();
     DB.del(DB.STORES.settings, 'draft');
@@ -4591,7 +4601,7 @@
   function startEdit(message) {
     state.editing = message;
     $('edit-strip').style.display = 'flex';
-    $('text').value = (message.body && message.body.text) || '';
+    setTextOf($('text'), (message.body && message.body.text) || '');
     autogrow();
     $('text').focus();
     tickEditCountdown();
@@ -4618,7 +4628,7 @@
     clearInterval(editTimer);
     state.editing = null;
     $('edit-strip').style.display = 'none';
-    $('text').value = '';
+    setTextOf($('text'), '');
     autogrow();
   }
 
@@ -4752,7 +4762,7 @@
     state.me = stored || DEFAULT_PROFILE[state.session.slot] || { handle: 'Fish', emoji: '🐟' };
     const draft = await DB.get(DB.STORES.settings, 'draft');
     if (draft) {
-      $('text').value = draft;
+      setTextOf($('text'), draft);
       autogrow();
     }
   }
@@ -5360,7 +5370,7 @@
         button.type = 'button';
         button.addEventListener('click', () => {
           const box = $('text');
-          box.value += emoji;
+          setTextOf(box, textOf(box) + emoji);
           noteEmoji(emoji);
           autogrow();
           saveDraft();
@@ -5696,9 +5706,20 @@
     document.addEventListener('paste', (event) => {
       if (!$('pool').classList.contains('on')) return;
       const files = event.clipboardData && event.clipboardData.files;
-      if (!files || !files.length) return;
-      event.preventDefault();
-      onFiles(files);
+      if (files && files.length) {
+        event.preventDefault();
+        return onFiles(files);
+      }
+      // #text is contenteditable="plaintext-only", which already strips
+      // incoming formatting on its own — except on a browser that doesn't
+      // support that mode yet (falls back to plain contenteditable), where a
+      // paste from a formatted source would otherwise carry its fonts/colors
+      // straight in. Force plain text there too. Scoped to #text specifically
+      // so a paste into #search-input, say, is left to its native handling.
+      if (event.target === $('text') && event.clipboardData) {
+        event.preventDefault();
+        document.execCommand('insertText', false, event.clipboardData.getData('text/plain'));
+      }
     });
     // Drag-and-drop, also on the document rather than #pool. A drop that lands
     // even slightly outside the thread would otherwise hit the browser default
