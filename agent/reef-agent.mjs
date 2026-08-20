@@ -27,8 +27,11 @@
 
 
 import { webcrypto as crypto } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, appendFileSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import {
+  existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, appendFileSync,
+  openSync, closeSync, fsyncSync, renameSync, statSync,
+} from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
@@ -169,26 +172,368 @@ async function request(path, { method = 'GET', token, json } = {}) {
   return body;
 }
 
+/* --- state on disk -------------------------------------------------------
+ *
+ * One file per identity, and more than one process writing it. `listen` runs
+ * for days off a single load(); every `send` and `read` is a separate
+ * short-lived process that loads, changes one thing and exits. So a save()
+ * that serialised whatever this process held in memory was not saving a
+ * change, it was publishing a whole snapshot — and a long-lived process's
+ * snapshot goes stale the moment anything else writes.
+ *
+ * Observed live: `send` adds an entry to `sent` and writes it; minutes later
+ * the listener handles an incoming message, saves its own hours-old map, and
+ * every entry added in between is gone. After a few listener restarts across
+ * one session the file held six entries from an older conversation and
+ * nothing from the current one. Delivery was never affected — the message is
+ * on the server before save() is reached — but a device's own sends can only
+ * ever come from this cache (nothing on the server is sealed for the sender),
+ * so a wiped one is a thread with holes where your own words were.
+ *
+ * A save is therefore a merge, not a snapshot: re-read the file, fold this
+ * process's changes into what is actually there now, write that back. Which
+ * fold is right is a per-field question, and that is all mergeState() is.
+ *
+ * Deliberately not an append-only log. `sent` alone would suit one — its
+ * entries are immutable, insert-only and capped — but `session` and `seq` are
+ * single current values that get replaced rather than accumulated, so they
+ * need a merge whatever `sent` does. Once the merge exists, `sent` is one
+ * line of it: the union of two insert-only maps loses nothing an append log
+ * would have kept. A second file would buy a slightly narrower race for the
+ * cost of a second format to compact, gitignore and keep alongside a file
+ * people copy by hand — holding the plaintext of every message sent, at that.
+ *
+ * The merge alone leaves one window: two processes that both read before
+ * either writes both write, and the first one's change is gone again. That
+ * looked too narrow to be worth a lock — a few syscalls over a 3 KB file —
+ * right up until the test measured it. Twelve `send`s launched together lost
+ * entries on every run with the merge in place and nothing serialising it, so
+ * the read-merge-write is taken under an advisory lock (see acquireSaveLock)
+ * and the whole of save() is synchronous to keep the section it guards as
+ * short as it can be.
+ */
+
+const SENT_LIMIT = 500;
+
+// Windows denies an open while another process renames its replacement into
+// place; the same codes come back from the rename itself. Never permanent.
+const BUSY = ['EPERM', 'EACCES', 'EBUSY'];
+
+/* Retrying here is not politeness, it is load-bearing: mistaking a file that
+ * is momentarily locked for a file that is not there would have save() merge
+ * against nothing and write precisely the clobber this section exists to stop.
+ * So null means the file genuinely does not exist, and a lock that outlasts
+ * the retries is raised rather than assumed away. */
+function readFileWithRetry(path) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return readFileSync(path, 'utf8');
+    } catch (e) {
+      if (e.code === 'ENOENT') return null;
+      if (attempt >= 10 || !BUSY.includes(e.code)) throw e;
+      sleepSync(10);
+    }
+  }
+}
+
+/* The file as it is *now*, to merge into. Content that will not parse is
+ * treated as absent rather than fatal: save() is on the listener's
+ * incoming-message path, where throwing would take the room down over a file
+ * this call is about to rewrite correctly anyway. load() is deliberately
+ * stricter — see there. */
+function readStateFile(path) {
+  const raw = readFileWithRetry(path);
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (e) {
+    process.stderr.write(`reef: state file ${path} did not parse (${e.message}); rewriting it\n`);
+    return null;
+  }
+}
+
+/* Field by field, because "whose copy wins" is a different question for each.
+ *
+ *   identity  the device key, written once. Whatever is on disk is what the
+ *             server has enrolled, so it is never overwritten — losing it is
+ *             the one clobber here that reconnecting cannot undo.
+ *   session   token/room/device, replaced wholesale by _unlockFresh(). Only a
+ *             process that has just unlocked knows anything the file doesn't;
+ *             everyone else leaves it alone. A stale token written over a
+ *             fresh one is survivable (the next call 401s and re-unlocks) but
+ *             that re-unlock invalidates the token whoever *was* using it
+ *             holds, which is the exact churn connect()'s cache exists to end.
+ *   seq       a resume cursor into a total order — the high-water mark of what
+ *             anything using this identity has consumed — so the higher wins.
+ *   sent      insert-only and immutable, so the union is simply correct. The
+ *             cap applies to the union, once, rather than each writer trimming
+ *             its own partial copy and calling the result the whole map.
+ *
+ * Anything else on disk — a field some newer version of this file knows about
+ * and this process does not — is carried through untouched rather than
+ * dropped for being unrecognised.
+ */
+function mergeState(disk, mine, { sessionIsMine }) {
+  const merged = { ...disk, ...mine };
+  merged.identity = disk.identity || mine.identity;
+  merged.session = sessionIsMine ? mine.session : (disk.session || mine.session);
+  merged.seq = Math.max(Number(disk.seq) || 0, Number(mine.seq) || 0);
+
+  const sent = { ...(disk.sent || {}), ...(mine.sent || {}) };
+  const ids = Object.keys(sent);
+  // Insertion order is chronological for both halves, so the front of the
+  // merged list is the oldest — same rule as before, applied to more of it.
+  for (const id of ids.slice(0, Math.max(0, ids.length - SENT_LIMIT))) delete sent[id];
+  merged.sent = sent;
+
+  return merged;
+}
+
+/* A synchronous pause. Atomics.wait is the only sleep Node has that neither
+ * yields to the event loop (which would let another save start inside this
+ * one) nor spins a core. */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch (e) {
+    /* refused (some embedders forbid blocking); the retry is still worth making */
+  }
+}
+
+/* Serialises the read-merge-write in save(). Exclusive create is the whole
+ * primitive — the same trick claim-message.sh uses with mkdir, no dependency
+ * and nothing to install — and the file holds the owner's pid purely so a
+ * human looking at a leftover one can see who left it.
+ *
+ * Advisory on purpose: a lock that cannot be taken is skipped, not raised.
+ * Every writer is merging anyway, so proceeding unlocked is at worst the narrow
+ * race this closes, whereas refusing to save would lose the change outright —
+ * a worse version of the bug being fixed.
+ */
+const SAVE_LOCK_STALE_MS = 5000;
+// Long enough that a lock left by a process that died inside save() always
+// becomes steal-eligible before a waiter gives up and writes unlocked.
+const SAVE_LOCK_WAIT_MS = SAVE_LOCK_STALE_MS + 1000;
+const noop = () => {};
+
+/* Wrong in the safe direction, deliberately: stealing a lock somebody is
+ * actually holding puts two writers in the critical section, which is the one
+ * thing this is here to prevent, so age is the only evidence accepted.
+ *
+ * The obvious extra check — is the pid in the file still alive — is not here
+ * on purpose. It was, and it was the single largest source of lost updates in
+ * the test: `process.kill(pid, 0)` came back ESRCH for processes that were
+ * demonstrably alive and mid-save (locks 0.2ms to 18ms old), every such false
+ * verdict put a second writer inside the section, and every run with one lost
+ * an entry. A liveness probe that is wrong in that direction is worse than no
+ * probe at all, and all it bought was recovering from a crash-during-save
+ * sooner than the timeout below already does.
+ *
+ * Age comes from the file's own mtime rather than a timestamp written inside
+ * it, because there is a moment between "created" and "written" when the
+ * content is still empty, and reading that as an unparseable timestamp is a
+ * false positive on exactly the contended path where it matters. */
+function saveLockIsStale(lockPath) {
+  try {
+    // A save holds this for tens of milliseconds — the fsync dominates — and
+    // its slowest possible path, every read and rename retry exhausted, is
+    // still inside a second. Anything this old was abandoned mid-save.
+    return Date.now() - statSync(lockPath).mtimeMs >= SAVE_LOCK_STALE_MS;
+  } catch (e) {
+    return false; // already gone, or momentarily unreadable: not ours to steal
+  }
+}
+
+function acquireSaveLock(statePath) {
+  const lockPath = statePath + '.save.lock';
+  const mine = `${process.pid} ${Date.now()}`;
+  const deadline = Date.now() + SAVE_LOCK_WAIT_MS;
+  do {
+    let fd;
+    try {
+      fd = openSync(lockPath, 'wx');
+      writeFileSync(fd, mine);
+      closeSync(fd);
+      return () => {
+        try {
+          // Only if it is still ours: a stale-lock steal may have replaced it,
+          // and unlinking the replacement would drop somebody else's guard.
+          if (readFileWithRetry(lockPath) === mine) unlinkSync(lockPath);
+        } catch (e) {
+          /* already gone */
+        }
+      };
+    } catch (e) {
+      if (fd !== undefined) closeSync(fd);
+      /* EEXIST is "somebody holds it". EPERM/EACCES is the *same* thing on
+       * Windows, where a file whose last handle has closed but whose delete
+       * has not yet completed refuses to be re-created — held, in other words,
+       * for another millisecond. Treating that as "no lock is available here"
+       * skipped the lock entirely, and under real contention that is the
+       * common case, not a rare one. */
+      if (e.code !== 'EEXIST' && !BUSY.includes(e.code)) return noop; // odd filesystem: carry on unlocked
+      if (e.code === 'EEXIST' && saveLockIsStale(lockPath)) {
+        try {
+          unlinkSync(lockPath);
+        } catch (stale) {
+          /* somebody else cleared it first */
+        }
+        continue;
+      }
+      sleepSync(5);
+    }
+  } while (Date.now() < deadline);
+  return noop;
+}
+
+/* A half-written state file is the same class of loss as a clobbered one and
+ * harder to see: load() cannot tell truncated from corrupt, and the file holds
+ * the device key. So write a sibling and rename over the target — rename
+ * replaces atomically on both platforms (MOVEFILE_REPLACE_EXISTING on
+ * Windows), leaving a reader with the old file or the new one and never half
+ * of either — and fsync first, so a crash cannot leave the rename pointing at
+ * bytes that never landed. */
+function writeJsonAtomic(path, value) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  const data = JSON.stringify(value, null, 2);
+  let fd;
+  try {
+    fd = openSync(tmp, 'w');
+    writeFileSync(fd, data);
+    try {
+      fsyncSync(fd);
+    } catch (e) {
+      /* not every filesystem implements it; the rename is still atomic */
+    }
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+
+  /* Windows refuses the rename outright while anything else holds the target
+   * open — another reef process reading it, or the virus scanner that opened
+   * it because we just wrote one. That clears in milliseconds, so it is a
+   * retry, not a failed save. */
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, path);
+      return;
+    } catch (e) {
+      if (attempt >= 10 || !BUSY.includes(e.code)) {
+        try {
+          unlinkSync(tmp);
+        } catch (cleanup) {
+          /* nothing left to clean up */
+        }
+        throw e;
+      }
+      sleepSync(10);
+    }
+  }
+}
+
 /* --- the agent ---------------------------------------------------------- */
 
 export class ReefAgent {
   constructor({ pin, statePath, label = 'agent' }) {
     Object.assign(this, { pin, statePath, label });
+    // Set by _unlockFresh(), and the only thing that entitles this process to
+    // write `session` back to the file. See mergeState().
+    this._sessionIsMine = false;
   }
 
   async load() {
-    try {
-      this.state = JSON.parse(await readFile(this.statePath, 'utf8'));
-    } catch (e) {
-      this.state = { identity: await newIdentity(), seq: 0 };
-      await this.save();
+    const raw = readFileWithRetry(this.statePath);
+
+    if (raw === null) {
+      /* No file at all: mint an identity. Created exclusively so two cold
+       * starts racing each other cannot both win — the loser adopts the
+       * winner's key instead of enrolling a second device that nobody asked
+       * for and the other side would have to approve. */
+      this.state = { identity: await newIdentity(), seq: 0, sent: {} };
+      try {
+        writeFileSync(this.statePath, JSON.stringify(this.state, null, 2), { flag: 'wx' });
+      } catch (e) {
+        if (e.code !== 'EEXIST') throw e;
+        // Lost the race. The winner may still be mid-write, and this is the one
+        // write here that cannot go through writeJsonAtomic() (the exclusive
+        // create is the whole point of it), so give it a moment to finish
+        // rather than reading half a key.
+        let winner = null;
+        for (let attempt = 0; attempt < 20 && !(winner && winner.identity); attempt++) {
+          if (attempt) sleepSync(10);
+          const text = readFileWithRetry(this.statePath);
+          try {
+            winner = text ? JSON.parse(text) : null;
+          } catch (parseError) {
+            winner = null; // still being written; that is what the retry is for
+          }
+        }
+        if (!winner || !winner.identity) {
+          throw new Error(`${this.statePath} appeared while starting up but has no identity in it.`);
+        }
+        this.state = winner;
+      }
+    } else {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        parsed = null;
+      }
+      if (!parsed || typeof parsed !== 'object') {
+        /* Fatal on purpose. This shared a branch with "no file at all" before,
+         * so a file that would not parse produced a brand new identity that
+         * was then written straight over it — turning a damaged state file
+         * into a destroyed device key, which is the one loss here nothing can
+         * undo: the room knows the old public key, the replacement device is
+         * unapproved, and the only local copy of everything sent went with it.
+         * Every write goes through writeJsonAtomic() now, so a truncated file
+         * should not be reachable; if one turns up, it is worth a look before
+         * anything overwrites it. */
+        throw new Error(
+          `${this.statePath} exists but does not parse as a state object. It holds ` +
+          `this device's key, so nothing here will overwrite it — inspect it, and ` +
+          `only delete it if it is truly unrecoverable (that enrols a new device, ` +
+          `which the other side then has to approve).`
+        );
+      }
+      this.state = parsed;
+      if (!this.state.identity) {
+        this.state.identity = await newIdentity();
+        await this.save();
+      }
     }
+
     this.privateKey = await importPrivate(this.state.identity.privateJwk);
     return this;
   }
 
-  save() {
-    return writeFile(this.statePath, JSON.stringify(this.state, null, 2));
+  /* Synchronous throughout, on purpose: read, merge and write are one critical
+   * section and the shorter it is, the smaller the window in which another
+   * process's write can land inside it. Async fs calls would also let two
+   * saves *within* this process interleave — the listener has that, since a
+   * socket message and a catch-up read both save. Still declared async so
+   * every existing `await this.save()` keeps working unchanged. */
+  async save() {
+    const release = acquireSaveLock(this.statePath);
+    let merged;
+    try {
+      const disk = readStateFile(this.statePath) || {};
+      merged = mergeState(disk, this.state, { sessionIsMine: this._sessionIsMine });
+      writeJsonAtomic(this.statePath, merged);
+    } finally {
+      release();
+    }
+    this._sessionIsMine = false;
+
+    /* Adopt back only what is purely additive. `sent` is a union, so taking
+     * the merged copy can only gain entries, which is the point — a `read` in
+     * this process now shows sends another process made. `seq` is deliberately
+     * not adopted: the merged value is how far *anything* has consumed, and
+     * pulling this process's cursor forward to it would skip rows this one has
+     * not delivered yet. */
+    this.state.sent = merged.sent;
   }
 
   /* `/unlock/` reissues this device's token every time it is called — it has
@@ -254,6 +599,10 @@ export class ReefAgent {
     this.state.session = {
       pin: this.pin, token: this.token, roomId: this.roomId, deviceId: this.deviceId,
     };
+    // The token was issued seconds ago, so this process holds the newest one
+    // there is — the only situation in which a writer should replace the
+    // session on disk rather than preserve whatever is already there.
+    this._sessionIsMine = true;
     await this.save();
     return this;
   }
@@ -320,10 +669,11 @@ export class ReefAgent {
     // addressed to the sender — reading your own message back is not possible
     // and never will be. The browser keeps its copy in IndexedDB; this keeps a
     // bounded one here, so `read` shows a thread rather than a row of failures.
+    // Bounding it is mergeState()'s job, not this one's: a process trimming its
+    // own copy to 500 and writing that is how the map used to lose entries it
+    // had never seen in the first place.
     this.state.sent = this.state.sent || {};
     this.state.sent[id] = text;
-    const ids = Object.keys(this.state.sent);
-    if (ids.length > 500) delete this.state.sent[ids[0]];
     await this.save();
     return result;
   }

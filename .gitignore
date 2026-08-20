@@ -17,3 +17,7 @@ agent/*.claims/
 agent/inbox/
 # Which chat session currently owns the room. Machine-local by definition.
 agent/*.owner
+# Half-written state files: every save writes <state>.json.tmp-<pid> and renames
+# it over the target, so one only survives a process dying mid-write. It is a
+# state file in every other respect, credential included — never commit one.
+agent/*.tmp-*
