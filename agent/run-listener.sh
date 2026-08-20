@@ -112,7 +112,7 @@ while true; do
     while kill -0 "$child" 2>/dev/null; do
       sleep 30
       kill -0 "$child" 2>/dev/null || break
-      last="$(stat -f %m agent/listen.log 2>/dev/null || stat -c %Y agent/listen.log 2>/dev/null || echo 0)"
+      last="$(stat --format=%Y agent/listen.log 2>/dev/null || stat -f %m agent/listen.log 2>/dev/null || echo 0)"
       now="$(date +%s)"
       if [ $((now - last)) -gt "$STALE_SECS" ]; then
         log "listen.log stale for ${STALE_SECS}s+, child pid $child looks frozen -- killing it"
