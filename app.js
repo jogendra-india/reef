@@ -5710,12 +5710,13 @@
         event.preventDefault();
         return onFiles(files);
       }
-      // #text is contenteditable="plaintext-only", which already strips
-      // incoming formatting on its own — except on a browser that doesn't
-      // support that mode yet (falls back to plain contenteditable), where a
+      // #text is contenteditable="true" rather than "plaintext-only" (see
+      // index.html) so an IME's media-insertion commit isn't silently
+      // rejected, which means nothing upstream strips formatting for us — a
       // paste from a formatted source would otherwise carry its fonts/colors
-      // straight in. Force plain text there too. Scoped to #text specifically
-      // so a paste into #search-input, say, is left to its native handling.
+      // straight in. Force plain text here instead. Scoped to #text
+      // specifically so a paste into #search-input, say, is left to its
+      // native handling.
       if (event.target === $('text') && event.clipboardData) {
         event.preventDefault();
         document.execCommand('insertText', false, event.clipboardData.getData('text/plain'));

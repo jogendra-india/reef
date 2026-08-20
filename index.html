@@ -505,14 +505,15 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 
       <div class="inputrow" id="inputrow">
         <button class="tap" id="attach" aria-label="Attach">＋</button>
-        <!-- contenteditable, not a textarea: Chrome only offers Gboard's GIF/
-             sticker keyboard (InputConnection#commitContent) to editable
-             elements, never to <textarea>/<input> — see app.js paste handler.
-             plaintext-only keeps it behaving like a plain multi-line field
-             (no pasted-in rich formatting, Enter -> literal newline) rather
-             than a rich-text editor; unsupported browsers fall back to plain
-             contenteditable and the paste handler covers the gap. -->
-        <div id="text" contenteditable="plaintext-only" role="textbox"
+        <!-- contenteditable, not a textarea: an IME's media-insertion API
+             (Gboard/Firefox GIF and sticker pickers) is only ever offered to
+             editable elements, never to <textarea>/<input>. Deliberately
+             "true" rather than "plaintext-only" — plaintext-only appears to
+             tell the IME the field won't accept non-text content at all,
+             which silently swallows the GIF commit rather than rejecting it
+             loudly. Formatting is instead stripped in app.js's paste handler,
+             which already has to run for the file-attachment case anyway. -->
+        <div id="text" contenteditable="true" role="textbox"
              aria-multiline="true" aria-label="Message" data-placeholder="Say something…"
              enterkeyhint="send" autocorrect="on"></div>
         <button class="tap" id="emoji-btn" aria-label="Emoji">☺</button>
