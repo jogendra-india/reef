@@ -38,6 +38,99 @@
     toastTimer = setTimeout(() => node.classList.remove('on'), 2600);
   }
 
+  /* ==================================================================== *
+   * Debug log
+   * ==================================================================== *
+   *
+   * On by default, and printed straight to the console, because the thing it
+   * exists for happens by surprise: a scroll to the top of the thread that
+   * replaces the whole screen with "N earlier messages cannot be opened on
+   * this device". Nobody can reproduce that on demand, so anything that has to
+   * be switched on first would only ever be switched on after the one moment
+   * worth recording. Every line is a short tag and a small object, so a
+   * session that never hits it costs a few dozen lines and nothing else.
+   *
+   * Nothing here logs message text, a handle, or key material — only ids,
+   * seqs and counts — because the console is the one place in an
+   * end-to-end-encrypted app where plaintext would be pasted into a bug
+   * report.
+   *
+   * In the console:
+   *   reef.dump()  — the whole ring buffer as text, to paste
+   *   reef.copy()  — the same, onto the clipboard
+   *   reef.now()   — what the window and the store look like right now
+   */
+  const LOG_KEEP = 500;
+  const logRing = [];
+  const logStart = Date.now();
+
+  const sinceBoot = () => ((Date.now() - logStart) / 1000).toFixed(2) + 's';
+  // Enough of a uuid to line two log lines up against each other, not enough to
+  // be worth redacting.
+  const short = (id) => String(id || '').slice(0, 8);
+
+  /* Routine lines are kept, not printed.
+   *
+   * Printing everything was right while the sealed-history bug was still being
+   * chased and wrong the moment it was understood: a normal session scrolled
+   * hundreds of lines past, which buries anything that matters and is no way
+   * to leave an app running. The ring still holds all of it, so `reef.dump()`
+   * and the Storage sheet's copy button answer exactly as they did — the
+   * console is simply no longer shouted at. Only the states that should never
+   * happen still print, and those should now be silent for good. */
+  function record(level, tag, detail) {
+    let text;
+    try {
+      text = detail === undefined ? '' : JSON.stringify(detail);
+    } catch (e) {
+      text = '[unserialisable]';
+    }
+    logRing.push(`${sinceBoot()} ${level === 'warn' ? '! ' : ''}${tag} ${text}`);
+    if (logRing.length > LOG_KEEP) logRing.shift();
+    if (level !== 'warn') return;
+    console.warn(`[reef ${sinceBoot()}] ${tag}`, detail === undefined ? '' : detail);
+  }
+
+  const log = (tag, detail) => record('log', tag, detail);
+  // For the states that should never happen — the only thing still printed.
+  const logBad = (tag, detail) => record('warn', tag, detail);
+
+  /* Gets the buffer off the device. There is no console on a phone, and this
+   * app is mostly used from one — which is the whole reason the lines are kept
+   * in a ring rather than only printed. Reached from Storage in the menu. */
+  async function copyDebugLog() {
+    const text = logRing.join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      /* no async clipboard: an insecure origin, or permission refused */
+    }
+    try {
+      // The old way, which still works in the places the one above does not.
+      const box = el('textarea');
+      box.value = text;
+      box.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+      document.body.appendChild(box);
+      box.select();
+      const copied = document.execCommand('copy');
+      box.remove();
+      return copied;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  self.reef = Object.assign(self.reef || {}, {
+    dump() {
+      const text = logRing.join('\n');
+      console.log(text);
+      return text;
+    },
+    copy: copyDebugLog,
+    now: () => viewReport('asked'),
+  });
+
   /* Each fish carries its own name, because picking one is how most people name
    * themselves here — the handle was a separate box you had to notice and edit,
    * so everybody stayed "Pufferfish" while wearing a shark.
@@ -686,7 +779,27 @@
    * Keys
    * ==================================================================== */
 
+  /* True for exactly as long as the pair keys are being rebuilt. Read only by
+   * the log: if a message ever turns unreadable during that window, this is
+   * what says so, and it is the difference between "the key is gone" and "the
+   * key was two awaits away". */
+  let keysRefreshing = false;
+
   async function refreshKeys() {
+    keysRefreshing = true;
+    log('keys.refresh');
+    try {
+      await refreshKeysInner();
+    } finally {
+      keysRefreshing = false;
+      log('keys.ready', {
+        recipients: state.recipients.map((r) => String(r.id)),
+        derived: Object.keys(state.pairKeys),
+      });
+    }
+  }
+
+  async function refreshKeysInner() {
     const result = await API.keys();
     state.recipients = result.recipients || [];
     state.session.safety_number = result.safety_number;
@@ -856,6 +969,13 @@
     stored.forEach((m) => state.messages.set(m.id, m));
     invalidateOrder();
     state.profiles = profiles;
+    // The baseline. If the store already holds sealed rows at boot, whatever
+    // made them so happened in an earlier session and was written to disk.
+    log('hydrate', {
+      stored: stored.length,
+      sealedOnDisk: stored.filter(unreadable).length,
+      thread: ordered().length,
+    });
     renderList();
   }
 
@@ -875,29 +995,62 @@
           : API.history({ page_size: 60 }),
         since ? API.history({ page_size: 40 }) : null,
       ]);
+      log('sync', {
+        since,
+        fresh: (fresh.results || []).length,
+        tail: tail ? (tail.results || []).length : null,
+      });
       await ingest(fresh.results || []);
       if (tail) await ingest(tail.results || []);
     } catch (err) {
+      log('sync.failed', { error: String((err && err.message) || err), offline: !!err.offline });
       if (!err.offline) console.warn('sync failed', err);
     }
   }
+
+  /* Set once the server answers a page request with nothing.
+   *
+   * Without it, a thread whose oldest stretch draws as one collapsed line can
+   * never fill the scroller, so scrollTop stays at the top, so every scroll
+   * event asks for another page — of a history that ran out some time ago. */
+  let reachedOldest = false;
 
   async function loadOlder() {
     // chronological() sorts a message still being sent to the end, which is what
     // this wants: its seq is null, and `cursor=null` asks the server for the
     // wrong page entirely.
     const oldest = chronological()[0];
-    if (!oldest || !oldest.seq) return;
+    if (!oldest || !oldest.seq) {
+      log('loadOlder.skip', { reason: oldest ? 'no-seq' : 'empty' });
+      return;
+    }
     try {
       const result = await API.history({ cursor: oldest.seq, page_size: 60 });
-      await ingest(result.results || [], true);
+      const got = result.results || [];
+      log('loadOlder.page', {
+        cursor: oldest.seq,
+        got: got.length,
+        // How much of the page the server sent as an envelope this device can
+        // even attempt — a page of rows with no envelope for us can only ever
+        // render sealed.
+        withEnvelope: got.filter((r) => !!r.envelope).length,
+        seqs: got.length ? `${got[0].seq}..${got[got.length - 1].seq}` : null,
+      });
+      if (!got.length) reachedOldest = true;
+      await ingest(got, true);
     } catch (e) {
-      /* offline: the local window is all there is */
+      log('loadOlder.failed', { error: String((e && e.message) || e), offline: !!e.offline });
     }
   }
 
   async function ingest(rows, prepend) {
     const decoded = [];
+    const viewBefore = Object.assign({}, state.view);
+    // Rows that arrive unopenable, and — separately, and much worse — rows that
+    // were readable on this device a moment ago and are about to be written
+    // back over as a placeholder.
+    let sealedIn = 0;
+    const clobbered = [];
     // Counted here rather than only on the live socket event, because the
     // live event was the only path that ever counted anything. A message
     // that arrived while the socket was reconnecting — which is routine,
@@ -921,6 +1074,7 @@
           /* no local copy */
         }
       }
+      const wasReadable = !!(existing && !unreadable(existing));
       const merged = Object.assign({}, existing || {}, {
         id: row.id,
         seq: row.seq,
@@ -951,8 +1105,34 @@
       // so the body stayed undefined and renderRow drew a bubble containing a
       // timestamp and nothing else. On a replacement device that was the entire
       // history rendered as dozens of blank rows.
-      if (!merged.body && !merged.deleted) merged.body = { undecryptable: true };
+      /* No envelope for this device at all, which is a different thing from a
+       * decrypt that failed — and permanent in a way that one is not.
+       *
+       * An envelope is sealed per recipient device at the moment of sending,
+       * so a device that joined later was never a recipient of anything older
+       * than itself and never will be. There is no key escrow and no history
+       * transfer here: those messages cannot be read on this device, today or
+       * ever. Recording which of the two it was stops healRun spending a
+       * round trip re-asking for an envelope that was never created. */
+      if (!merged.body && !merged.deleted) {
+        merged.body = { undecryptable: true, noEnvelope: !row.envelope };
+      }
       if (merged.deleted) merged.body = null;
+      if (unreadable(merged)) {
+        sealedIn++;
+        // This one is the bug, not a symptom: a message this device could read
+        // is going back to disk as unopenable, and putMessages makes that
+        // permanent. If the console shows these, the sealed run on screen was
+        // manufactured locally rather than fetched that way.
+        if (wasReadable) {
+          clobbered.push({
+            id: short(row.id),
+            seq: row.seq,
+            sender: String(row.sender_device_id),
+            hadEnvelope: !!row.envelope,
+          });
+        }
+      }
       decoded.push(merged);
       // Not on a history page load — those are pages the reader asked for by
       // scrolling, the opposite of something they missed — and not the
@@ -994,6 +1174,24 @@
       // window forward under the reader — one older message dropped and one
       // newer gained, for every message the other person sends.
       if (added > 0) state.view.tail += added;
+    }
+    log('ingest', {
+      rows: rows.length,
+      prepend: !!prepend,
+      added,
+      sealedIn,
+      thread: ordered().length,
+      held: state.messages.size,
+      view: `${viewBefore.count}/${viewBefore.tail} → ${state.view.count}/${state.view.tail}`,
+      keysRefreshing,
+    });
+    if (clobbered.length) {
+      logBad('ingest.overwrote-readable', {
+        count: clobbered.length,
+        first: clobbered.slice(0, 8),
+        keysRefreshing,
+        have: Object.keys(state.pairKeys),
+      });
     }
     renderList(prepend);
     markVisibleRead();
@@ -1121,7 +1319,21 @@
 
   async function tryOpen(row) {
     const key = pairKeyFor(row.sender_device_id);
-    if (!key) return null;
+    if (!key) {
+      // The interesting case is a sender this device *does* otherwise know:
+      // that is a key that went missing rather than one that never existed.
+      log('open.no-key', {
+        id: short(row.id),
+        seq: row.seq,
+        sender: String(row.sender_device_id),
+        have: Object.keys(state.pairKeys),
+        knownRecipient: state.recipients.some(
+          (r) => String(r.id) === String(row.sender_device_id)
+        ),
+        keysRefreshing,
+      });
+      return null;
+    }
     try {
       return await C.openMessage(key, row.envelope, {
         messageId: row.id,
@@ -1131,6 +1343,13 @@
     } catch (e) {
       // A message sealed for a device that has since been replaced. Showing a
       // placeholder is honest; pretending it never existed is not.
+      log('open.failed', {
+        id: short(row.id),
+        seq: row.seq,
+        sender: String(row.sender_device_id),
+        error: String((e && e.message) || e),
+        keysRefreshing,
+      });
       return { undecryptable: true };
     }
   }
@@ -1303,14 +1522,27 @@
    * re-requested on every render; a stretch that is genuinely gone (no
    * envelope ever existed for it) just fails the same way again once and
    * is then left alone for the rest of this session. */
-  const healedRuns = new Set();
+  const healTried = new Set();
   async function healRun(run) {
-    const first = run[0];
-    const last = run[run.length - 1];
-    if (!first || !last || !first.seq || !last.seq) return;
+    /* Kept per message rather than per range.
+     *
+     * The key used to be the run's own seq range, and the range changes every
+     * time the window widens — so scrolling up re-requested the same broken
+     * stretch on every render, two hundred rows at a time, and the dedupe
+     * never once fired. Message ids do not move, so this asks for any given
+     * message exactly once per session however the run around it grows.
+     *
+     * Messages the server holds no envelope for are dropped here too: there
+     * is nothing to fetch a second time, and asking again cannot change that. */
+    const fresh = run.filter(
+      (m) => m.seq && !healTried.has(m.id) && !(m.body && m.body.noEnvelope)
+    );
+    if (!fresh.length) return;
+    const first = fresh[0];
+    const last = fresh[fresh.length - 1];
     const key = first.seq + ':' + last.seq;
-    if (healedRuns.has(key)) return;
-    healedRuns.add(key);
+    fresh.forEach((m) => healTried.add(m.id));
+    log('heal.start', { range: key, rows: fresh.length, ofRun: run.length });
     let since = first.seq - 1;
     let fetchedAny = false;
     try {
@@ -1323,9 +1555,21 @@
         since = rows[rows.length - 1].seq;
       }
     } catch (e) {
-      healedRuns.delete(key); // offline, or a blip — worth trying again later
+      // Offline, or a blip — worth trying again later, so the attempt is
+      // forgotten rather than counted against these messages for the session.
+      fresh.forEach((m) => healTried.delete(m.id));
+      log('heal.failed', { range: key, error: String((e && e.message) || e) });
       return;
     }
+    // Whether the second chance took. Still-sealed after a re-fetch means the
+    // envelope really is not readable here, rather than a page that landed
+    // badly the first time.
+    log('heal.done', {
+      range: key,
+      fetchedAny,
+      stillSealed: fresh.filter((m) => unreadable(state.messages.get(m.id) || m)).length,
+      of: fresh.length,
+    });
     if (fetchedAny) renderList(true);
   }
 
@@ -1393,10 +1637,10 @@
    * The rendered window
    * ==================================================================== *
    *
-   * At most MAX_ROWS are ever in the DOM. renderList rebuilds every visible row
-   * from scratch, so an unbounded window meant a long scroll back made every
-   * later repaint — a tick, a reaction — proportionally slower, and it only ever
-   * grew within a session.
+   * At most MAX_DRAWN rows are ever in the DOM. renderList rebuilds every
+   * visible row from scratch, so an unbounded window meant a long scroll back
+   * made every later repaint — a tick, a reaction — proportionally slower, and
+   * it only ever grew within a session.
    *
    * Measured from the *end*, not as absolute indices: loading older messages
    * puts them at the front of the sorted array and shifts every index, whereas
@@ -1404,9 +1648,39 @@
    *
    *   end   = length - tail
    *   start = end - count
+   *
+   * The cap counts *rows drawn*, not messages held, and the difference is not
+   * academic. A run of unreadable messages collapses to a single line however
+   * long it is, so on a device that joined late — and therefore holds no
+   * envelope for anything older than itself — two hundred messages can draw as
+   * one line. Capping on message count and paying the excess out of `tail`
+   * then slid the window's newest edge backwards over the handful of messages
+   * that *were* readable, and the screen went blank but for that one line. The
+   * DOM is the only thing the cap was ever protecting, so the DOM is what it
+   * measures. The window's length stays bounded by the local store either way.
    */
-  const MAX_ROWS = 200;
+  const MAX_DRAWN = 200;
   const PAGE_ROWS = 40;
+
+  /* How many *messages* a window spans when it is positioned outright rather
+   * than grown — jumping to a search hit, or back to the foot of the thread.
+   * Distinct from MAX_DRAWN, which bounds what reaches the DOM; this bounds
+   * what a single deliberate move takes in, and drawing it can only cost less. */
+  const WINDOW_SPAN = 200;
+
+  /* What a window costs to draw: one per readable message, one per unbroken
+   * run of unreadable ones. Mirrors renderList's own loop, which is the only
+   * definition of "a row" that matters here. */
+  function drawCost(rows, start, end) {
+    let cost = 0;
+    for (let i = start; i < end; i++) {
+      if (unreadable(rows[i])) {
+        while (i + 1 < end && unreadable(rows[i + 1])) i++;
+      }
+      cost++;
+    }
+    return cost;
+  }
 
   function viewBounds(rows) {
     /* `tail` can only be as far back as leaves a full window in front of it.
@@ -1428,18 +1702,82 @@
      * so growNewer counts down from a real number rather than spending its
      * first several pages working off an excess the reader never asked for. */
     const room = Math.max(0, rows.length - state.view.count);
-    if (state.view.tail > room) state.view.tail = room;
+    if (state.view.tail > room) {
+      // Reached only when something overshot `tail`, which is the old route to
+      // a window that had walked off the front of the thread. Logged rather
+      // than silently corrected so an overshoot still leaves a trace.
+      logBad('view.tail-clamped', {
+        tail: state.view.tail,
+        room,
+        count: state.view.count,
+        thread: rows.length,
+      });
+      state.view.tail = room;
+    }
     const end = Math.max(0, rows.length - state.view.tail);
     return { start: Math.max(0, end - state.view.count), end };
   }
 
-  /* Holds the window at its cap by dropping from the newest end, which keeps
-   * `start` exactly where widening put it. */
-  function trimView() {
-    if (state.view.count <= MAX_ROWS) return;
-    state.view.tail += state.view.count - MAX_ROWS;
-    state.view.count = MAX_ROWS;
+  /* What the window and the store look like at this instant, for the log and
+   * for `reef.now()`. Cheap enough to call on every render. */
+  function viewReport(why) {
+    const rows = ordered();
+    const chrono = chronological();
+    const { start, end } = viewBounds(rows);
+    const report = {
+      why,
+      thread: rows.length,
+      held: state.messages.size,
+      window: `${start}..${end}`,
+      count: state.view.count,
+      tail: state.view.tail,
+      sealedInWindow: rows.slice(start, end).filter(unreadable).length,
+      sealedInThread: rows.filter(unreadable).length,
+      // What the window costs the DOM, which is the number the cap is on.
+      drawn: drawCost(rows, start, end),
+      reachedOldest,
+      stickBottom: state.stickBottom,
+      keys: Object.keys(state.pairKeys).length,
+      keysRefreshing,
+      online: state.online,
+      seqs: chrono.length
+        ? `${(chrono[0] || {}).seq}..${(chrono[chrono.length - 1] || {}).seq}`
+        : null,
+    };
+    if (why === 'asked') console.log('[reef] now', report);
+    return report;
   }
+
+  /* Holds the window at its cap by dropping from the newest end, which keeps
+   * `start` exactly where widening put it.
+   *
+   * Walks forward from `start` totting up drawn rows and stops at the budget,
+   * so the cost is one pass however far back the window reaches. A window that
+   * draws as a handful of lines is left entirely alone — which is the whole
+   * point, and the reason the readable tail no longer falls off the bottom. */
+  function trimView() {
+    const rows = ordered();
+    const end = Math.max(0, rows.length - state.view.tail);
+    const start = Math.max(0, end - state.view.count);
+
+    let cost = 0;
+    let cut = start;
+    while (cut < end && cost < MAX_DRAWN) {
+      if (unreadable(rows[cut])) {
+        while (cut + 1 < end && unreadable(rows[cut + 1])) cut++;
+      }
+      cost++;
+      cut++;
+    }
+    if (cut >= end) return;
+
+    state.view.tail += end - cut;
+    state.view.count = Math.max(0, cut - start);
+  }
+
+  // See the end of renderList: what the sealed runs looked like last time, so
+  // an unchanged one is not logged again.
+  let lastSealedSig = null;
 
   function renderList(keepAnchor) {
     const scroller = $('scroller');
@@ -1477,6 +1815,12 @@
     const { start, end } = viewBounds(rows);
     const visible = rows.slice(start, end);
 
+    // Counted through the loop below so the log describes what was actually
+    // put on screen, not what was intended.
+    let sealedRuns = 0;
+    let sealedRows = 0;
+    let realRows = 0;
+
     let lastDay = null;
     for (let index = 0; index < visible.length; index++) {
       const message = visible[index];
@@ -1504,8 +1848,17 @@
          * stretch collapses to this single line, the anchor search then found
          * nothing, scrollTop was left pinned near the top, and every further
          * scroll event grew the window again without ever moving the view. The
-         * window walked off the front of the thread from one flick. */
-        sealed.dataset.id = message.id;
+         * window walked off the front of the thread from one flick.
+         *
+         * Keyed to the run's *last* message, not its first. Runs grow upwards
+         * — scrolling back reveals older messages, which join the front of the
+         * same run — so the first message changes on every widening and the id
+         * changed with it. The anchor search then looked for a row that no
+         * longer existed under that name, scrollTop stayed pinned at 0, and
+         * the next scroll event widened the window again: the runaway above,
+         * driven by the one line that was supposed to survive it. The last
+         * message of a run does not move. */
+        sealed.dataset.id = visible[last].id;
         list.appendChild(sealed);
         // The server keeps every envelope forever, so a run that reads as
         // broken is not necessarily gone for good — it may just be the one
@@ -1515,6 +1868,8 @@
         // scrolling here never comes through again on its own. Scrolling to
         // it is the only signal this range still matters, so that is the
         // trigger to ask the server for it again.
+        sealedRuns++;
+        sealedRows += count;
         healRun(visible.slice(index, last + 1));
         index = last;
         lastDay = null; // the next real message re-states its day
@@ -1538,8 +1893,38 @@
         !next ||
         next.mine !== message.mine ||
         new Date(next.createdAt) - new Date(message.createdAt) >= 180000;
+      realRows++;
       list.appendChild(renderRow(message, { grouped, tail }));
     }
+
+    /* The reported bug, stated as a condition: the window holds messages, and
+     * every one of them drew as a sealed line. That is the screen where the
+     * thread "disappears" and is replaced by a single count, so it is logged
+     * loudly and with everything needed to tell which of the two ways it got
+     * there — a window that slid onto an unopenable stretch of real history,
+     * or a stretch that was readable until this session made it unopenable. */
+    /* Only when the shape of it changes. A sealed run that is simply sitting
+     * there gets redrawn by every tick and every reaction, and logging each of
+     * those would push the lines that explain how it got there out of the far
+     * end of the ring — which are the only ones worth having. */
+    const sealedSig = sealedRuns
+      ? `${sealedRuns}/${sealedRows}/${realRows}/${start}..${end}`
+      : null;
+    if (sealedSig && sealedSig !== lastSealedSig) {
+      if (!realRows) {
+        logBad('render.all-sealed', {
+          report: viewReport('all-sealed'),
+          sealedRows,
+          sealedRuns,
+          anchorId: short(anchorId),
+          // Which stretch of history the window had landed on when it collapsed.
+          seqs: `${(visible[0] || {}).seq}..${(visible[visible.length - 1] || {}).seq}`,
+        });
+      } else {
+        log('render.sealed-run', { sealedRuns, sealedRows, realRows, window: `${start}..${end}` });
+      }
+    }
+    lastSealedSig = sealedSig;
 
     if (anchorId) {
       // Without this the thread jerks as you scroll up: content grows above the
@@ -1547,6 +1932,15 @@
       const back = list.querySelector(`[data-id="${CSS.escape(anchorId)}"]`);
       if (back) {
         scroller.scrollTop += back.getBoundingClientRect().top - anchorTop;
+      } else {
+        // The row the view was held by is no longer rendered, so scrollTop is
+        // left wherever it was — near the top, which fires another scroll
+        // event, which widens the window again. This is the runaway.
+        logBad('render.anchor-lost', {
+          anchorId: short(anchorId),
+          window: `${start}..${end}`,
+          scrollTop: Math.round(scroller.scrollTop),
+        });
       }
     } else if (state.stickBottom) {
       scrollToBottom(false);
@@ -1914,7 +2308,7 @@
     // pinning to the foot of the DOM would stop at whatever the window ends on.
     if (state.view.tail) {
       state.view.tail = 0;
-      state.view.count = Math.min(MAX_ROWS, Math.max(60, state.view.count));
+      state.view.count = Math.min(WINDOW_SPAN, Math.max(60, state.view.count));
       renderList();
     }
     pinToBottom(smooth);
@@ -2545,6 +2939,20 @@
   // that has since moved on to a different picture.
   let viewerOpen = 0;
 
+  /* The one way out, whichever control asked for it — the ✕, the backdrop,
+   * Escape, or the hardware back button. It was four inline
+   * `classList.remove('on')` calls, and a history entry has to be spent
+   * exactly once however the picture was dismissed. */
+  function closeViewer() {
+    const viewer = $('viewer');
+    if (!viewer.classList.contains('on')) return;
+    viewer.classList.remove('on');
+    // A video left playing behind a closed viewer keeps talking. The node is
+    // removed on the next open, but that may be a long way off.
+    [...viewer.querySelectorAll('video')].forEach((node) => node.pause());
+    overlayClosed();
+  }
+
   async function openViewer(attachment, file) {
     const viewer = $('viewer');
     [...viewer.querySelectorAll('img,video')].forEach((n) => n.remove());
@@ -2556,6 +2964,7 @@
       node.autoplay = true;
     }
     viewer.appendChild(node);
+    if (!viewer.classList.contains('on')) overlayOpened('viewer');
     viewer.classList.add('on');
     if (!isVideo) attachZoom(viewer, node);
     const mine = ++viewerOpen;
@@ -2577,7 +2986,7 @@
       if (mine === viewerOpen) node.src = url;
     } catch (e) {
       if (mine === viewerOpen && !node.src) {
-        viewer.classList.remove('on');
+        closeViewer();
         toast('Could not open that at full size');
       }
     }
@@ -2769,20 +3178,153 @@
   // sheet with no way out had one after all.
   let sheetLocked = false;
 
+  /* ==================================================================== *
+   * Overlays and the back button
+   * ==================================================================== *
+   *
+   * On Android, back is the same gesture as "close this" everywhere else on
+   * the phone. Installed to the Home Screen there was nothing on the history
+   * stack to spend, so pressing it over an open photo did not close the photo
+   * — it left the conversation altogether, which for a PWA means a cold start
+   * back to the lock screen. The way out of that is to give back something of
+   * ours to consume: each overlay pushes one entry when it opens and spends it
+   * again when it closes, whichever way it was closed.
+   *
+   * The two flags keep the two stacks — ours and the browser's — from
+   * chasing each other. `spending` marks the pop we asked for ourselves, so
+   * the handler ignores it rather than closing a second overlay; `viaBack`
+   * marks the opposite case, where the browser has already dropped the entry
+   * and closing must not try to drop another. Without the first, dismissing a
+   * photo opened from a sheet closed the sheet along with it.
+   */
+  let overlayDepth = 0;
+  let spending = false;
+  let viaBack = false;
+
+  /* Spending an entry waits a tick.
+   *
+   * Half the menu closes the sheet and opens another one in the same breath,
+   * and a `history.back()` racing a `pushState` in a single turn leaves the
+   * two stacks out of step — the traversal is queued, the push is not. A tick
+   * is long enough for the pair to cancel out instead: the entry the closing
+   * overlay was about to spend is handed straight to the one replacing it, and
+   * neither touches the history stack at all. */
+  let owed = 0;
+  let spendTimer = null;
+
+  function scheduleSpend() {
+    if (spendTimer) return;
+    spendTimer = setTimeout(() => {
+      spendTimer = null;
+      const count = owed;
+      owed = 0;
+      if (!count) return;
+      spending = true;
+      history.go(-count);
+    }, 0);
+  }
+
+  function overlayOpened(name) {
+    overlayDepth++;
+    // An entry is already sitting there unspent — take that one over.
+    if (owed) {
+      owed--;
+      return;
+    }
+    try {
+      history.pushState({ reefOverlay: name, depth: overlayDepth }, '');
+    } catch (e) {
+      // No history to push (a sandboxed frame). The buttons still work and
+      // back behaves exactly as it did before any of this.
+      overlayDepth--;
+    }
+  }
+
+  function overlayClosed() {
+    if (!overlayDepth) return;
+    overlayDepth--;
+    if (viaBack) return; // the browser popped it already
+    owed++;
+    scheduleSpend();
+  }
+
+  window.addEventListener('popstate', () => {
+    if (spending) {
+      spending = false;
+      return;
+    }
+    if (!overlayDepth) return; // not ours: let the browser do as it likes
+    viaBack = true;
+    try {
+      // Topmost first. The viewer sits above the sheet, so when both are open
+      // it is the one in front of you and the one back should answer.
+      if ($('viewer').classList.contains('on')) {
+        closeViewer();
+      } else if ($('sheet').classList.contains('on')) {
+        // A locked sheet is one the app is insisting on — approving a device,
+        // changing a PIN. Back does not dismiss it, so the entry it just spent
+        // goes straight back, or the *next* press would leave the app.
+        //
+        // Pushed directly rather than through overlayOpened: nothing opened
+        // here, and the depth already counts this sheet. Going through it
+        // added a second count that never came off, and every later close was
+        // then one short.
+        if (sheetLocked) {
+          try {
+            history.pushState({ reefOverlay: 'sheet' }, '');
+          } catch (e) {
+            /* nothing to restore it to */
+          }
+        } else {
+          closeSheet();
+        }
+      } else {
+        // Nothing on screen to close, so the books were out by one. Straighten
+        // them rather than leave an entry to swallow a later back press.
+        overlayDepth--;
+      }
+    } finally {
+      viaBack = false;
+    }
+  });
+
   function openSheet(build, options) {
     sheetLocked = !!(options && options.locked);
     const sheet = $('sheet');
     sheet.innerHTML = '';
-    sheet.appendChild(el('div', 'grab'));
+    /* The handle closes the sheet.
+     *
+     * Tapping the scrim was the only way out, and a sheet tall enough to fill
+     * the screen leaves no scrim to tap — so the devices list, which is the
+     * longest sheet there is, became a dialog with no exit at all. Capping its
+     * height gives the scrim back; this gives the way out somewhere obvious to
+     * live, at the one part of a sheet that is always on screen. */
+    const handle = el('button', 'grabrow');
+    handle.type = 'button';
+    handle.setAttribute('aria-label', 'Close');
+    handle.appendChild(el('div', 'grab'));
+    handle.addEventListener('click', () => {
+      if (!sheetLocked) closeSheet();
+    });
+    sheet.appendChild(handle);
+    // A sheet always opens at its own beginning, whatever the last one left
+    // behind — the element is reused, and so is its scroll position.
+    sheet.scrollTop = 0;
     build(sheet);
     $('scrim').classList.add('on');
+    // Only when it was not already up: openSheet is called straight over an
+    // open sheet in a few places — a menu item that leads to another sheet —
+    // and that replaces the one on screen rather than stacking a second.
+    if (!sheet.classList.contains('on')) overlayOpened('sheet');
     sheet.classList.add('on');
   }
 
   function closeSheet() {
+    if (!$('sheet').classList.contains('on')) return;
     sheetLocked = false;
     $('sheet').classList.remove('on');
     $('scrim').classList.remove('on');
+    overlayClosed();
   }
 
   // Where the quick row starts before anybody has used the app. Once there is a
@@ -3174,6 +3716,22 @@
             'device holds the only copy, so those are kept whatever the size.'
         )
       );
+
+      /* The debug log, for when the thread does something it should not — most
+       * of all a scroll back that leaves nothing on screen but a count of
+       * messages that cannot be opened. Nothing readable goes in it: ids,
+       * seqs and counts only. */
+      const copy = el('button', 'act');
+      copy.appendChild(el('span', 'ico', '🐞'));
+      copy.appendChild(el('span', null, 'Copy debug log'));
+      copy.addEventListener('click', async () => {
+        // Recorded before the copy, so the buffer says what the screen looked
+        // like at the moment somebody thought it was worth sending.
+        log('log.copied', viewReport('copied'));
+        const copied = await copyDebugLog();
+        toast(copied ? 'Debug log copied' : 'Could not copy it');
+      });
+      sheet.appendChild(copy);
     });
   }
 
@@ -4985,13 +5543,13 @@
     const rows = ordered();
     const index = rows.findIndex((m) => m.id === id);
     if (index < 0) return null;
-    state.view.count = MAX_ROWS;
+    state.view.count = WINDOW_SPAN;
     // Centred where there is room on both sides. The upper clamp is what keeps a
     // window full: without it, a match near the oldest message pushed `end` below
     // the cap and rendered a stunted window with the match jammed against the
     // top of it.
-    const centred = rows.length - index - Math.ceil(MAX_ROWS / 2);
-    state.view.tail = Math.max(0, Math.min(centred, Math.max(0, rows.length - MAX_ROWS)));
+    const centred = rows.length - index - Math.ceil(WINDOW_SPAN / 2);
+    state.view.tail = Math.max(0, Math.min(centred, Math.max(0, rows.length - WINDOW_SPAN)));
     state.stickBottom = false;
     renderList();
     return (
@@ -5208,7 +5766,7 @@
     $('scrim').addEventListener('click', () => {
       if (!sheetLocked) closeSheet();
     });
-    $('viewer-close').addEventListener('click', () => $('viewer').classList.remove('on'));
+    $('viewer-close').addEventListener('click', closeViewer);
     $('viewer').addEventListener('click', (event) => {
       // A pinch or a pan ends in a click. Closing on it would mean the viewer
       // shut itself the moment you finished moving the picture.
@@ -5216,7 +5774,14 @@
         $('viewer')._swallowClick = false;
         return;
       }
-      if (event.target.id === 'viewer') $('viewer').classList.remove('on');
+      if (event.target.id === 'viewer') closeViewer();
+    });
+    // The other way out, for a keyboard. The viewer first: it sits above the
+    // sheet, so it is the thing in front of you when both are open.
+    document.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      if ($('viewer').classList.contains('on')) return closeViewer();
+      if ($('sheet').classList.contains('on') && !sheetLocked) closeSheet();
     });
     $('lock-register').addEventListener('click', openRegisterSheet);
     // Re-runs unlock with the *same* device id, so the server can reconsider a
@@ -5321,11 +5886,19 @@
     try {
       const rows = ordered();
       if (viewBounds(rows).start === 0) {
+        // The whole thread is on screen and the server has none left to give.
+        if (reachedOldest) return;
+        log('growOlder.fetch', { thread: rows.length, count: state.view.count, tail: state.view.tail });
         await loadOlder();
         return;
       }
       state.view.count += PAGE_ROWS;
       trimView();
+      log('growOlder.widen', {
+        thread: rows.length,
+        count: state.view.count,
+        tail: state.view.tail,
+      });
       renderList(true);
     } finally {
       /* The guard now covers widening too, and is released a frame later rather
@@ -5345,6 +5918,7 @@
   function growNewer() {
     if (!state.view.tail) return;
     state.view.tail = Math.max(0, state.view.tail - PAGE_ROWS);
+    log('growNewer', { count: state.view.count, tail: state.view.tail });
     renderList(true);
   }
 

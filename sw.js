@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v54';
-const BUILD = '2026-08-08f';
+const CACHE = 'reef-shell-v58';
+const BUILD = '2026-08-17e';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -128,10 +128,34 @@ async function handlePush(event) {
   });
   if (windows.some((client) => client.visibilityState === 'visible')) return;
 
+  // Free, if the server ever says so itself. Costs one condition and saves the
+  // round trip below on every message this person sent.
+  if (payload.mine === true) return;
+
   const generic = {
     title: 'Reef',
     body: '🐟 New ripple',
   };
+
+  /* Anything this person sent themselves, from any of their devices.
+   *
+   * One PIN seats a person, not a device, so signing in on a phone and a
+   * laptop puts both on the same seat — and the server pushes to every
+   * subscribed device in the room. The laptop was therefore buzzing about
+   * messages its owner had just typed on the phone. A notification is for
+   * something the other party did; your own words arriving on your own second
+   * screen are not news.
+   *
+   * `mine` is the server's own per-seat answer, the same field the thread uses
+   * to decide which side of the screen a bubble goes on, so this needs no
+   * reasoning about device ids and stays right when devices are added or
+   * revoked. It is read off the row rather than guessed, which costs a lookup
+   * the "hidden" path did not used to make — and buys back the /keys/ fetch
+   * that path never needed, since the row is now found once and used by both
+   * of the questions below.
+   */
+  const found = await locate(payload.id);
+  if (found && found.row.mine) return;
 
   // "hidden" is the default, and it needs no decryption at all — the cheapest
   // path is also the most private one.
@@ -140,7 +164,10 @@ async function handlePush(event) {
   }
 
   try {
-    const detail = await decryptForNotification(payload.id);
+    // Nothing found means nothing to open: offline, or a message already past
+    // the recent window. The generic line still goes out, exactly as it did
+    // when the decryption failed for any other reason.
+    const detail = found ? await describe(found) : null;
     if (!detail) return show(generic, payload);
     if (payload.privacy === 'sender') {
       return show({ title: 'Reef', body: `${detail.emoji} ${detail.handle}` }, payload);
@@ -213,42 +240,58 @@ async function muted() {
   }
 }
 
-async function decryptForNotification(messageId) {
-  // ReefDB has no session() — it never did. The call threw on every push, the
-  // throw was swallowed by handlePush, and every notification silently came out
-  // as the generic "New ripple" no matter what privacy setting was chosen.
-  const [sessions, identity] = await Promise.all([
-    self.ReefDB.sessions(),
-    self.ReefDB.identity(),
-  ]);
-  if (!identity) return null;
-
-  // The payload is a message id and nothing else, and one PIN can seat someone
-  // in several rooms, so the room this belongs to has to be found by asking.
-  for (const [roomId, session] of Object.entries(sessions || {})) {
+/* Which room this message is in, and the row itself.
+ *
+ * The payload is a message id and nothing else, and one PIN can seat someone in
+ * several rooms, so the room has to be found by asking each of them. Only the
+ * row is fetched here — whether this person sent it is answered straight off
+ * it, and opening it is a separate job that most notifications never need. */
+async function locate(messageId) {
+  if (!messageId) return null;
+  let sessions = {};
+  try {
+    sessions = (await self.ReefDB.sessions()) || {};
+  } catch (e) {
+    return null;
+  }
+  for (const [roomId, session] of Object.entries(sessions)) {
     if (!session || !session.token) continue;
     try {
-      const detail = await lookInRoom(roomId, session, identity, messageId);
-      if (detail) return detail;
+      // Wider than the decryption path used to ask for. A row that falls off
+      // the end of this list cannot be checked, and the notification then goes
+      // out anyway — so the window has to cover a burst of messages sent in
+      // one go, which is precisely when the wrong ones used to arrive.
+      const response = await fetch(API_BASE + '/entries/?page_size=25', {
+        headers: { Authorization: 'Token ' + session.token },
+      });
+      if (!response.ok) continue;
+      const list = await response.json();
+      const row = (list.results || []).find((m) => m.id === messageId);
+      if (row) return { roomId, session, row };
     } catch (e) {
-      /* wrong room, or a key that cannot open it: try the next */
+      /* wrong room, or offline: try the next */
     }
   }
   return null;
 }
 
-async function lookInRoom(roomId, session, identity, messageId) {
-  const headers = { Authorization: 'Token ' + session.token };
-  const [keysResponse, listResponse] = await Promise.all([
-    fetch(API_BASE + '/keys/', { headers }),
-    fetch(API_BASE + '/entries/?page_size=10', { headers }),
-  ]);
-  if (!keysResponse.ok || !listResponse.ok) return null;
+/* Opens a located row far enough to name who sent it and what they said.
+ *
+ * ReefDB has no session() — it never did. That call threw on every push, the
+ * throw was swallowed by handlePush, and every notification silently came out
+ * as the generic "New ripple" no matter what privacy setting was chosen. */
+async function describe(found) {
+  const { roomId, session, row } = found;
+  if (!row.envelope) return null;
 
-  const keys = await keysResponse.json();
-  const list = await listResponse.json();
-  const row = (list.results || []).find((m) => m.id === messageId);
-  if (!row || !row.envelope) return null;
+  const identity = await self.ReefDB.identity();
+  if (!identity) return null;
+
+  const response = await fetch(API_BASE + '/keys/', {
+    headers: { Authorization: 'Token ' + session.token },
+  });
+  if (!response.ok) return null;
+  const keys = await response.json();
 
   const sender = (keys.recipients || []).find((r) => r.id === row.sender_device_id);
   if (!sender) return null;
