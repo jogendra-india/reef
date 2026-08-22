@@ -433,6 +433,24 @@
      * the page, so it lives beside the tokens it is guarding. */
     locked: () => getShared('locked'),
     setLocked: (value) => putShared(!!value, 'locked'),
+    /* How patient this device is about locking itself.
+     *
+     * Shared rather than per-room, like the bell above and for the same reason:
+     * it is a property of the browser, not of a conversation. A phone that
+     * leaves the house wants a minute; the laptop nobody else touches wants
+     * never, and neither of them is a fact about the person you are talking to.
+     *
+     * The preset *key* is stored, not the milliseconds behind it, so the table
+     * in app.js can be retuned later without every device that already chose
+     * "2 minutes" being frozen on whatever two minutes meant that day. Absent
+     * means the default, which is what everyone had before this was a setting. */
+    lockAfter: () => getShared('lock-after'),
+    setLockAfter: (value) => putShared(value, 'lock-after'),
+    /* Whether closing the app counts as walking away. Absent means no, so
+     * nobody who never opens the setting has their app behave differently
+     * tomorrow than it did today. */
+    lockOnReopen: () => getShared('lock-on-reopen'),
+    setLockOnReopen: (value) => putShared(!!value, 'lock-on-reopen'),
     async wipeEverything() {
       // Signing out has to take the shared vault too, or the next person to
       // use this browser inherits its keys and tokens.

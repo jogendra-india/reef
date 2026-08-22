@@ -221,6 +221,12 @@
     pendingDevices: [],
     // Mirrors the stored setting so the menu can label the bell without an await.
     notifications: true,
+    // Which row of LOCK_PRESETS this device is on, and whether reopening the
+    // app asks for the PIN. Mirrored here so the timers and the sheet can read
+    // them synchronously. The literal rather than LOCK_DEFAULT: this object is
+    // built at the top of the file, and the table is declared further down.
+    lockAfter: '2m',
+    lockOnReopen: false,
     // Whether the browser has promised not to evict this origin. The keypair
     // lives in IndexedDB and cannot be re-created, so this is the difference
     // between being signed out and becoming a different device.
@@ -515,6 +521,12 @@
         deviceId: room.device.id,
         status: room.device.status,
         slot: room.session.slot,
+        // Kept alongside the token because boot() needs it before it has asked
+        // /session/ anything — and, offline, before it can ask at all. A room
+        // that skips device approval also skips every lock timer, so without a
+        // stored copy of this flag the lock-on-reopen check at boot would put a
+        // PIN screen in front of exactly the rooms that opted out of one.
+        autoApprove: !!room.session.auto_approve_devices,
       };
     });
     await DB.setSessions(sessions);
@@ -530,6 +542,23 @@
     // does not leave the app locked against a PIN the server just accepted.
     await DB.setLocked(false).catch(() => {});
     await enterRoom(preferred.room_id, preferred);
+  }
+
+  /* Keeps the stored copy of a room's auto-approve flag honest.
+   *
+   * An admin can turn it on for a room that was ordinary when this device last
+   * unlocked, and the stale `false` left behind is the one that hurts: it is
+   * what boot() reads to decide whether to demand a PIN, and demanding one from
+   * an unattended agent seat is how a channel goes quiet with nobody to notice.
+   * Called wherever a fresh session lands, which is every point the server gets
+   * a chance to tell us it changed. */
+  async function rememberAutoApprove() {
+    const stored = state.sessions[state.roomId];
+    if (!stored || !state.session) return;
+    const flag = !!state.session.auto_approve_devices;
+    if (stored.autoApprove === flag) return;
+    stored.autoApprove = flag;
+    await DB.setSessions(state.sessions).catch(() => {});
   }
 
   /* Which conversation to open when a PIN opens several.
@@ -624,6 +653,7 @@
       state.device = result.device;
       state.session = result.session;
     }
+    await rememberAutoApprove();
     await afterUnlock();
   }
 
@@ -723,6 +753,7 @@
         stopWaitingForApproval();
         state.device = result.device;
         state.session = result.session;
+        await rememberAutoApprove();
         toast('Approved. Welcome in.');
         await afterUnlock();
       } else if (result.device.status === 'revoked') {
@@ -1474,6 +1505,7 @@
       const result = await API.session();
       state.session = Object.assign({}, state.session, result.session);
       state.device = result.device || state.device;
+      await rememberAutoApprove();
       seedPresence();
     } catch (e) {
       /* offline; the header already says so */
@@ -3654,13 +3686,103 @@
       action('🔢', 'Change PIN', () => openPinSheet());
       action('💾', 'Storage', openStorageSheet);
       action('↻', 'Force refresh', forceRefresh);
-      action('🔒', 'Lock now', lockNow);
+      // A room that skips device approval has already opted out of every lock
+      // timer — idleReset and watchVisibility both refuse to fire in one — so
+      // offering "Lock after 5 minutes" there would be a promise the app has
+      // deliberately stopped making. Locking by hand is a different thing: that
+      // is something you just did, not something being guaranteed for later, so
+      // it stays on the menu either way.
+      if (state.session && state.session.auto_approve_devices) {
+        action('🔒', 'Lock now', lockNow);
+      } else {
+        action('🔒', 'Lock', openLockSheet);
+      }
       if (state.build) {
         // Answers "did my fix actually deploy?" without guessing.
         const stamp = el('div', 'sheet-title', 'Build ' + state.build);
         stamp.style.cssText += ';text-align:center;padding-top:8px';
         sheet.appendChild(stamp);
       }
+    });
+  }
+
+  /* When this device asks for the PIN again.
+   *
+   * Two minutes on a desk and five away were fine for a phone in a pocket and
+   * wrong for everything else: the laptop in a locked room retyped a PIN all
+   * day, and the phone that gets handed around wanted a minute. Both timers are
+   * one setting because two of them is a quiz — "lock after" is the question
+   * anybody actually has, and the away threshold that follows from it is
+   * bookkeeping.
+   *
+   * Re-rendered by reopening itself, which is how the checkmark moves. openSheet
+   * replaces an open sheet rather than stacking one, so this costs nothing. */
+  function openLockSheet() {
+    // Defensive. The sheet can outlive the room it was opened from — a switch
+    // through openRoomSheet, or a hello frame arriving with a session that says
+    // the room turned auto-approve while you were reading it — and controls that
+    // are guaranteed to do nothing are worse than no controls.
+    if (state.session && state.session.auto_approve_devices) {
+      return toast('This conversation does not use the lock');
+    }
+    const chosen = LOCK_PRESETS[state.lockAfter] ? state.lockAfter : LOCK_DEFAULT;
+    openSheet((sheet) => {
+      const row = (icon, label, sub, fn) => {
+        const button = el('button', 'act');
+        button.appendChild(el('span', 'ico', icon));
+        if (sub) {
+          const stack = el('div', 'stack');
+          stack.appendChild(el('b', null, label));
+          stack.appendChild(el('span', 'sub', sub));
+          button.appendChild(stack);
+        } else {
+          button.appendChild(el('span', null, label));
+        }
+        button.addEventListener('click', fn);
+        sheet.appendChild(button);
+      };
+
+      sheet.appendChild(
+        el(
+          'div',
+          'sheet-title',
+          'How long this device waits before asking for your PIN again. Only ' +
+            'this browser — your other devices keep their own answer.'
+        )
+      );
+      Object.keys(LOCK_PRESETS).forEach((key) => {
+        row(key === chosen ? '✓' : '', LOCK_PRESETS[key].label, null, async () => {
+          await setLockAfter(key);
+          openLockSheet();
+        });
+      });
+
+      sheet.appendChild(
+        el(
+          'div',
+          'sheet-title',
+          'Closing the app is not the same as leaving it open. Say what should ' +
+            'happen when you come back to it.'
+        )
+      );
+      row(
+        state.lockOnReopen ? '🔒' : '🔓',
+        state.lockOnReopen
+          ? 'Ask for your PIN after closing the app'
+          : 'Stay open after closing the app',
+        'Refreshing the page does not count as closing it.',
+        async () => {
+          await setLockOnReopen(!state.lockOnReopen);
+          openLockSheet();
+        }
+      );
+
+      // Still here, because it used to be the whole of this menu entry and
+      // burying it two taps deeper would be a loss on its own.
+      row('🔒', 'Lock now', null, () => {
+        closeSheet();
+        lockNow();
+      });
     });
   }
 
@@ -4756,6 +4878,7 @@
 
   async function loadProfileSettings() {
     state.notifications = await notificationsActive();
+    await loadLockSettings();
     await loadEmojiUses();
     // Shared across rooms: you are the same fish everywhere.
     const stored = await DB.profile(state.session.slot);
@@ -4849,6 +4972,7 @@
         state.device = event.device || state.device;
         if (event.session) {
           state.session = Object.assign({}, state.session, event.session);
+          await rememberAutoApprove();
         }
         if (event.devices) await applyDevices(event.devices);
         seedPresence();
@@ -5124,7 +5248,63 @@
    * Auto-lock and the privacy screen
    * ==================================================================== */
 
-  const LOCK_AFTER = 5 * 60 * 1000;
+  /* The five answers to "lock after".
+   *
+   * Two clocks, one choice. `idle` is on-screen idleness and `away` is how long
+   * the app may sit in the background before coming back locked — and `away` is
+   * looser on purpose, because switching to the camera to send a photo is not
+   * the same as leaving the phone on a table. The old hardcoded pair was two
+   * minutes and five, so '2m' is the default and nothing changes for anybody
+   * who never opens the sheet.
+   *
+   * Keyed by what gets stored, so retuning any number here does not orphan the
+   * devices that already chose it. Insertion order is display order.
+   */
+  const LOCK_PRESETS = {
+    '1m': { label: '1 minute', idle: 60 * 1000, away: 60 * 1000 },
+    '2m': { label: '2 minutes', idle: 2 * 60 * 1000, away: 5 * 60 * 1000 },
+    '5m': { label: '5 minutes', idle: 5 * 60 * 1000, away: 10 * 60 * 1000 },
+    '15m': { label: '15 minutes', idle: 15 * 60 * 1000, away: 30 * 60 * 1000 },
+    // Infinity rather than a very large number: both timers test for it by name
+    // and never arm at all, so nothing is left ticking to be wrong about.
+    never: { label: 'Never', idle: Infinity, away: Infinity },
+  };
+  const LOCK_DEFAULT = '2m';
+  // Falls back rather than trusting the stored key: a preset removed in a later
+  // build must not leave a device with no lock at all.
+  const lockPreset = () => LOCK_PRESETS[state.lockAfter] || LOCK_PRESETS[LOCK_DEFAULT];
+
+  async function setLockAfter(key) {
+    if (!LOCK_PRESETS[key]) return;
+    state.lockAfter = key;
+    await DB.setLockAfter(key).catch(() => {});
+    // Immediately, not when the old one expires. Going from fifteen minutes to
+    // one and then watching the app sit there for another fourteen looks like
+    // the setting was ignored — and going the other way locks the sheet you are
+    // still reading out from under you.
+    idleReset();
+  }
+
+  async function setLockOnReopen(on) {
+    state.lockOnReopen = !!on;
+    await DB.setLockOnReopen(state.lockOnReopen).catch(() => {});
+  }
+
+  /* Both preferences, out of the vault and into state.
+   *
+   * Called from loadProfileSettings with the rest of them, and separately from
+   * boot — the reopen decision is made before any room is entered, and
+   * loadProfileSettings runs from inside enterRoom, which is several awaits too
+   * late to be asked whether this load should have shown a PIN screen. */
+  async function loadLockSettings() {
+    const stored = await DB.lockAfter().catch(() => null);
+    state.lockAfter = LOCK_PRESETS[stored] ? stored : LOCK_DEFAULT;
+    state.lockOnReopen = !!(await DB.lockOnReopen().catch(() => false));
+    // afterUnlock starts the idle clock before this has finished reading, so
+    // the first timer of the session is armed on the default. Re-arm it on what
+    // was actually stored; it is a no-op while the app is locked or hidden.
+    idleReset();
+  }
 
   async function forceRefresh() {
     // Escape hatch for a client stuck on an old build. Drops every cache and
@@ -5211,8 +5391,23 @@
     entry = '';
     paintDots();
     $('lock-note').textContent = '';
+    noteOfflineLock();
     showScreen('lock');
     offerPinResetFromLock();
+  }
+
+  /* Says so when the PIN cannot be checked at all.
+   *
+   * There is no offline PIN check and deliberately never will be one: unlocking
+   * re-derives through /unlock/, so on a plane the six correct digits come back
+   * "No connection" and the app looks broken rather than merely locked. The
+   * timers are not softened for it — an airplane-mode bypass is not a lock —
+   * but the screen can at least say which of the two it is. */
+  const OFFLINE_LOCK_NOTE = 'You will need a connection to unlock this device.';
+
+  function noteOfflineLock() {
+    if (navigator.onLine !== false) return;
+    $('lock-note').textContent = OFFLINE_LOCK_NOTE;
   }
 
   /* Locks a conversation left open and untouched.
@@ -5228,8 +5423,11 @@
    * Deliberately only genuine input resets it. Scroll events fire from
    * `scrollToBottom` too, so a talkative peer would otherwise hold the session
    * open with nobody present.
+   *
+   * How long is LOCK_PRESETS' business now, and this is re-read on every reset
+   * rather than captured once — the setting can change mid-session, and a timer
+   * armed with the old number would outlive the choice that replaced it.
    */
-  const IDLE_LOCK = 2 * 60 * 1000;
   let idleTimer = null;
 
   function idleReset() {
@@ -5240,9 +5438,14 @@
     // an always-on agent channel.
     if (state.locked || document.visibilityState !== 'visible' ||
         (state.session && state.session.auto_approve_devices)) return;
+    const after = lockPreset().idle;
+    // "Never" is not a very long timeout: setTimeout clamps to a 32-bit delay
+    // and would fire almost immediately on Infinity, which is the exact
+    // opposite of what was asked for.
+    if (!isFinite(after)) return;
     idleTimer = setTimeout(() => {
       if (!state.locked) lockNow();
-    }, IDLE_LOCK);
+    }, after);
   }
 
   function idleStop() {
@@ -5269,8 +5472,9 @@
       } else {
         $('privacy').classList.remove('on');
         const skipsIdleLock = state.session && state.session.auto_approve_devices;
-        if (state.hiddenAt && Date.now() - state.hiddenAt > LOCK_AFTER && !state.locked &&
-            !skipsIdleLock) {
+        const away = lockPreset().away;
+        if (isFinite(away) && state.hiddenAt && Date.now() - state.hiddenAt > away &&
+            !state.locked && !skipsIdleLock) {
           lockNow();
         } else {
           markVisibleRead();
@@ -5896,6 +6100,11 @@
     window.addEventListener('online', () => {
       flushOutbox();
       if (state.stream) state.stream.connect();
+      // The note explaining why the PIN cannot be checked outlives the reason
+      // for it otherwise, and stale advice on a lock screen is worse than none.
+      if ($('lock-note').textContent === OFFLINE_LOCK_NOTE) {
+        $('lock-note').textContent = '';
+      }
     });
   }
 
@@ -5949,6 +6158,27 @@
    * ==================================================================== */
 
   async function boot() {
+    /* Whether the app was already open, or is being opened.
+     *
+     * sessionStorage is per tab and dies with it, so a key that is already
+     * there means this page load is a refresh, a navigation, or the reload the
+     * service worker triggers when it takes over — and one that is missing
+     * means the app was actually closed and reopened. Read before anything
+     * else, because a great deal below reloads the page.
+     *
+     * Nothing else can tell these apart: an installed PWA gets a plain cold
+     * start either way, and the "was it locked" flag in the vault deliberately
+     * says nothing about it. See the lock-on-reopen check further down. */
+    let sameSession = false;
+    try {
+      sameSession = sessionStorage.getItem('reef-live') === '1';
+      sessionStorage.setItem('reef-live', '1');
+    } catch (e) {
+      // Storage blocked entirely, which private mode does. Every load then
+      // reads as a fresh open — erring towards asking for the PIN, which is
+      // the direction to be wrong in.
+    }
+
     buildDots();
     buildKeypad();
     buildEmoji();
@@ -6029,21 +6259,40 @@
 
     const sessions = await DB.sessions();
     const roomIds = Object.keys(sessions);
+    // Prefer a room this device is actually approved in; a pending one can
+    // only show the waiting screen. Decided up here rather than inside the
+    // branch, because the reopen check below needs to know which room it would
+    // be resuming into before it can say whether to resume at all.
+    const roomId =
+      roomIds.find((id) => sessions[id].status === 'active') || roomIds[0];
     // A lock has to survive the page. Otherwise "Lock now" and the five-minute
     // auto-lock only hid the screen, and pull-to-refresh — or simply reopening
     // the PWA — put the conversation straight back on it.
     const wasLocked = await DB.locked().catch(() => false);
-    if (roomIds.length && !wasLocked) {
+    // Read here and not from loadProfileSettings, which does not run until a
+    // room is open — by then the decision this makes has already been made.
+    await loadLockSettings();
+    /* The other half of "lock when reopened".
+     *
+     * Deliberately not written to the vault: that flag is shared by every tab
+     * and outlives the page, and this is a fact about *this* page load only.
+     * Persisting it would let a second tab opened at lunchtime lock the first
+     * one that somebody is in the middle of typing into.
+     *
+     * Skipped in an auto-approve room, which has opted out of the whole lock,
+     * from a copy of the flag cached beside the token — state.session does not
+     * exist yet here, and asking the server for it needs a network that a cold
+     * start on a train does not have. Getting this wrong strands an agent seat
+     * behind a PIN prompt with nobody there to type it. */
+    const relock =
+      !sameSession && state.lockOnReopen && !(sessions[roomId] || {}).autoApprove;
+    if (roomIds.length && !wasLocked && !relock) {
       state.sessions = sessions;
       // Nothing set this on the way in, only unlockWith did — so after any
       // refresh the app ran with locked still true, and watchVisibility's
       // `!state.locked` guard meant auto-lock could never fire again.
       state.locked = false;
       await ensureIdentity();
-      // Prefer a room this device is actually approved in; a pending one can
-      // only show the waiting screen.
-      const roomId =
-        roomIds.find((id) => sessions[id].status === 'active') || roomIds[0];
       DB.useRoom(roomId, sessions[roomId].slot);
       state.roomId = roomId;
       API.setToken(sessions[roomId].token);
@@ -6055,7 +6304,15 @@
           // Offline start: everything needed to read this room is already
           // local, so open it rather than demanding a PIN with no network.
           state.device = { id: sessions[roomId].deviceId, status: 'active' };
-          state.session = { slot: sessions[roomId].slot || 1 };
+          // The cached flag earns its keep here too. This stub used to carry
+          // only the seat, so an auto-approve room started offline had every
+          // lock timer running against it — the one kind of room where they are
+          // meant never to fire — and locked itself while there was no network
+          // to unlock with.
+          state.session = {
+            slot: sessions[roomId].slot || 1,
+            auto_approve_devices: !!sessions[roomId].autoApprove,
+          };
           state.locked = false;
           showScreen('pool');
           await loadProfileSettings();
@@ -6071,6 +6328,9 @@
       }
     }
     showScreen('lock');
+    // Before explainSignOut, which has something more specific to say when it
+    // has anything at all.
+    noteOfflineLock();
     explainSignOut();
     offerPinResetFromLock();
   }
