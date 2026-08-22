@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v62';
-const BUILD = '2026-08-22b';
+const CACHE = 'reef-shell-v63';
+const BUILD = '2026-08-22c';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -60,9 +60,19 @@ self.addEventListener('fetch', (event) => {
   // and someone could sit on known-broken code indefinitely without any signal
   // that they were. For an app this small the extra round trip is cheap, and
   // offline still works because the cache answers whenever the network cannot.
+  //
+  // cache: 'no-store' on the fetch itself, not just "ask the network first" —
+  // a plain fetch(request) still lets the browser's own HTTP cache answer
+  // transparently if GitHub Pages' response headers say it's still fresh, so
+  // "network first" was only ever bypassing *this* cache, not the browser's.
+  // That gap is invisible on a browser whose HTTP cache happens to revalidate
+  // aggressively, and very visible on one that doesn't: two shell files
+  // (index.html, app.js) fetched as independent requests can end up on two
+  // different sides of a deploy, one fresh and one stale, and nothing here
+  // ever notices because both requests still "succeed".
   event.respondWith(
     caches.open(CACHE).then((cache) =>
-      fetch(request)
+      fetch(request, { cache: 'no-store' })
         .then((response) => {
           if (response && response.ok) cache.put(request, response.clone());
           return response;

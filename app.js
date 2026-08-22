@@ -3799,6 +3799,11 @@
             'happen when you come back to it.'
         )
       );
+      // Same ring-plus-background as the presets above, not just the padlock
+      // flipping — a lone emoji swap next to unchanged black text read as "did
+      // that tap even do anything?" the same way the presets' bare checkmark
+      // did, and for the same reason: state.lockOnReopen is true here means
+      // the setting is *on*, so it gets the same "this one is active" mark.
       row(
         state.lockOnReopen ? '🔒' : '🔓',
         state.lockOnReopen
@@ -3808,7 +3813,8 @@
         async () => {
           await setLockOnReopen(!state.lockOnReopen);
           openLockSheet();
-        }
+        },
+        state.lockOnReopen
       );
 
       // Still here, because it used to be the whole of this menu entry and
@@ -5915,6 +5921,16 @@
    * Wiring
    * ==================================================================== */
 
+  /* $(id).addEventListener(...), except a missing id skips its own binding
+   * instead of throwing — which, unhandled, would abort every binding still
+   * to come in whichever function called this, not just the one that was
+   * actually missing. */
+  function bindSafely(id, type, handler) {
+    const target = $(id);
+    if (!target) return;
+    target.addEventListener(type, handler);
+  }
+
   function wire() {
     $('text').addEventListener('input', onTyping);
     $('text').addEventListener('blur', stopTyping);
@@ -6005,13 +6021,23 @@
     // Search moved into the menu (below) — a header button is prime real
     // estate, and locking is something you reach for in a hurry, which
     // finding a conversation from is not.
-    $('lock-btn').addEventListener('click', lockNow);
-    $('search-close').addEventListener('click', closeSearch);
-    $('search-input').addEventListener('input', () => {
+    //
+    // bindSafely rather than $(id).addEventListener from here on: this whole
+    // cluster is menu, search and the viewer — none of them foundational, all
+    // of them added or renamed at different times — and $(id) on a stale or
+    // renamed id returns null, whose .addEventListener throws and silently
+    // aborts every binding still to come in this function. That is exactly
+    // how a rename in one file landing a beat behind the other (a deploy where
+    // index.html and app.js were briefly out of sync — see sw.js) took the
+    // menu button down along with the one that was actually renamed: #menu
+    // was wired several lines after the element that no longer existed.
+    bindSafely('lock-btn', 'click', lockNow);
+    bindSafely('search-close', 'click', closeSearch);
+    bindSafely('search-input', 'input', () => {
       clearTimeout(searchTimer);
       searchTimer = setTimeout(() => runSearch($('search-input').value), 140);
     });
-    $('search-input').addEventListener('keydown', (event) => {
+    bindSafely('search-input', 'keydown', (event) => {
       if (event.key === 'Escape') return closeSearch();
       if (event.key !== 'Enter') return;
       event.preventDefault();
@@ -6021,16 +6047,16 @@
       runSearch($('search-input').value);
       if (searchHits.length) jumpTo(searchHits[searchHits.length - 1].message.id);
     });
-    $('match-prev').addEventListener('click', () => stepMatch(-1));
-    $('match-next').addEventListener('click', () => stepMatch(1));
-    $('match-close').addEventListener('click', clearMatches);
-    $('menu').addEventListener('click', openMenuSheet);
-    $('device-banner').addEventListener('click', openDevicesSheet);
-    $('scrim').addEventListener('click', () => {
+    bindSafely('match-prev', 'click', () => stepMatch(-1));
+    bindSafely('match-next', 'click', () => stepMatch(1));
+    bindSafely('match-close', 'click', clearMatches);
+    bindSafely('menu', 'click', openMenuSheet);
+    bindSafely('device-banner', 'click', openDevicesSheet);
+    bindSafely('scrim', 'click', () => {
       if (!sheetLocked) closeSheet();
     });
-    $('viewer-close').addEventListener('click', closeViewer);
-    $('viewer').addEventListener('click', (event) => {
+    bindSafely('viewer-close', 'click', closeViewer);
+    bindSafely('viewer', 'click', (event) => {
       // A pinch or a pan ends in a click. Closing on it would mean the viewer
       // shut itself the moment you finished moving the picture.
       if ($('viewer')._swallowClick) {
@@ -6040,11 +6066,18 @@
       if (event.target.id === 'viewer') closeViewer();
     });
     // The other way out, for a keyboard. The viewer first: it sits above the
-    // sheet, so it is the thing in front of you when both are open.
+    // sheet, so it is the thing in front of you when both are open. Bound to
+    // document, so nothing here can be missing — kept safe anyway since it
+    // reaches into #viewer and #sheet, and one of those going away should
+    // still leave the other's shortcut working.
     document.addEventListener('keydown', (event) => {
       if (event.key !== 'Escape') return;
-      if ($('viewer').classList.contains('on')) return closeViewer();
-      if ($('sheet').classList.contains('on') && !sheetLocked) closeSheet();
+      try {
+        if ($('viewer').classList.contains('on')) return closeViewer();
+        if ($('sheet').classList.contains('on') && !sheetLocked) closeSheet();
+      } catch (e) {
+        /* one of the two is missing; the other still gets a chance next key */
+      }
     });
     $('lock-register').addEventListener('click', openRegisterSheet);
     // Re-runs unlock with the *same* device id, so the server can reconsider a
