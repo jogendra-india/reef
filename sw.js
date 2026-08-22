@@ -9,8 +9,8 @@ importScripts('./crypto.js', './db.js');
 
 // Bumping this purges every older cache on activate. Do it whenever the shell
 // changes in a way a stale client must not keep running.
-const CACHE = 'reef-shell-v63';
-const BUILD = '2026-08-22c';
+const CACHE = 'reef-shell-v64';
+const BUILD = '2026-08-22d';
 const API_BASE = 'https://ledgerbal.com/api/reef';
 
 const SHELL = [
@@ -20,6 +20,11 @@ const SHELL = [
   './api.js',
   './crypto.js',
   './db.js',
+  // Not importScripts'd — the worker never draws a picker. It is here purely so
+  // the emoji catalogue is in the offline shell along with everything else the
+  // page needs: without this line the app opens fine on a plane and the ☺
+  // button gives you an empty drawer.
+  './emoji-data.js',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',

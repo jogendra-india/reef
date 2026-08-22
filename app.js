@@ -3398,29 +3398,25 @@
    *
    * The six quick ones cover most of it and stay one tap away, but they were
    * also the *only* ones — so the composer could send any emoji in the app and a
-   * reaction could be one of six. Same list the composer draws from, so there is
-   * one catalogue rather than two that drift. */
+   * reaction could be one of six. Literally the same picker the composer draws,
+   * built by buildEmojiPicker, so there is one catalogue and one search rather
+   * than two of each quietly drifting apart. */
   function openReactionPicker(message) {
     const current = myReactionList(message);
     openSheet((sheet) => {
       sheet.appendChild(el('div', 'sheet-title', 'React with anything.'));
       const panel = el('div', 'picker');
-      Object.entries(emojiGroups()).forEach(([group, list]) => {
-        panel.appendChild(el('div', 'emoji-head', group));
-        const grid = el('div', 'emoji-grid');
-        list.forEach((emoji) => {
-          const button = el('button', null, emoji);
-          button.type = 'button';
-          if (current.includes(emoji)) button.classList.add('picked');
-          button.addEventListener('click', () => {
-            closeSheet();
-            toggleReaction(message, emoji);
-          });
-          grid.appendChild(button);
-        });
-        panel.appendChild(grid);
-      });
       sheet.appendChild(panel);
+      buildEmojiPicker(panel, {
+        // Plain emoji characters throughout — that is what a reaction *is* on
+        // the wire and in IndexedDB, so the mark on an already-chosen one is
+        // still a string compare and not a lookup through some id scheme.
+        picked: (emoji) => current.includes(emoji),
+        pick: (emoji) => {
+          closeSheet();
+          toggleReaction(message, emoji);
+        },
+      });
     });
   }
 
@@ -5584,44 +5580,216 @@
     return out;
   }
 
-  const EMOJI = {
-    Reef: ['🐟', '🐠', '🐡', '🦈', '🐙', '🦑', '🦐', '🦀', '🐳', '🐬', '🪸', '🐚', '🌊', '⚓', '🏝️', '🫧'],
-    Smileys: ['😀', '😄', '😅', '🤣', '😊', '🙂', '😉', '😍', '🥰', '😘', '😜', '🤪', '🤔', '🤗', '🙃', '😴',
-      '😌', '😏', '🥲', '😢', '😭', '😤', '😡', '🥵', '🥶', '😱', '🤯', '😳', '🥺', '😬', '🙄', '😶'],
-    Hands: ['👍', '👎', '👌', '🤌', '✌️', '🤞', '🫶', '🙏', '👏', '🙌', '💪', '🤝', '👋', '🤙', '☝️', '✋'],
-    Hearts: ['❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '💔', '❣️', '💕', '💞', '💓', '💗', '💖', '✨'],
-    Life: ['🔥', '⭐', '🎉', '🎂', '🍕', '☕', '🍺', '🌙', '☀️', '🌈', '⚡', '🌸', '🍀', '🎵', '💤', '🚀'],
-  };
+  /* ==================================================================== *
+   * The emoji picker
+   * ==================================================================== *
+   *
+   * One drawer, drawn into two places: the panel under the composer and the
+   * sheet you get from ＋ on a message. Same catalogue, same search, same tab
+   * you left it on — they used to be two nearly-identical loops, and the day
+   * one of them grew a feature was the day they stopped being the same thing.
+   *
+   * The catalogue itself lives in emoji-data.js. It is ~1,400 glyphs now
+   * rather than the ninety-six this app shipped with, which is what forced the
+   * rest of the design below: ninety-six can all be in the DOM at once and
+   * nobody notices, fourteen hundred cannot. */
 
-  /* The catalogue with the person's own most-used at the head of it. Rebuilt on
+  /* emoji-data.js is in the service worker's shell list and is a <script> tag
+   * above this one, so in practice it is always here. The fallback is not
+   * hypothetical though: a client can end up on a half-updated shell — new
+   * app.js, cached index.html with no tag for the new file — and a bare
+   * `ReefEmoji.categories` there is a ReferenceError at boot, i.e. an app that
+   * will not start because its emoji list is missing. This costs it a picker
+   * instead. */
+  const CATALOGUE = (self.ReefEmoji && self.ReefEmoji.categories) || [];
+  const EMOJI_INDEX = (self.ReefEmoji && self.ReefEmoji.index) || [];
+  const EMOJI_NAME = new Map(EMOJI_INDEX.map((item) => [item.char, item.name]));
+
+  // Enough to fill the visible grid several times over without ever being the
+  // reason a keystroke feels slow. Typing "a" matches a few hundred names, and
+  // nobody scrolls to the two hundredth result of "a" — they type a second
+  // letter.
+  const EMOJI_HITS = 120;
+
+  /* Which tab the picker was left on. Deliberately shared by both surfaces and
+   * kept across opens: picking 🥭 from Food, sending it, and going back for 🍇
+   * meant scrolling to Food again every single time. */
+  let emojiTab = 0;
+
+  /* The catalogue with the person's own most-used at the head of it. Built on
    * each open rather than once at boot, or it would show the tally as it stood
-   * when the app started. */
-  function emojiGroups() {
-    const favourites = topEmoji(16, []);
-    return favourites.length
-      ? { 'Most used': favourites, ...EMOJI }
-      : EMOJI;
+   * when the app started — which is to say, before everything you sent today. */
+  function emojiTabs() {
+    const favourites = topEmoji(32, []);
+    if (!favourites.length) return CATALOGUE;
+    return [
+      {
+        name: 'Most used',
+        icon: '🕘',
+        items: favourites.map((char) => ({ char, name: EMOJI_NAME.get(char) || '' })),
+      },
+      ...CATALOGUE,
+    ];
+  }
+
+  /* Name match, ordered by where in the name it hit.
+   *
+   * The rank is the whole point of this. "cat" is in the name of 🐱, and it is
+   * also inside "identification" and "location" — 🪪 and 📍 are honest matches
+   * and worth keeping findable, but they cannot be among the first things
+   * offered to somebody who just typed the name of an animal. So: start of the
+   * name beats the start of a later word, which beats buried inside a word.
+   *
+   * sort() is stable in every engine this runs on, so within a rank the
+   * catalogue's own order holds and the grid does not reshuffle itself under
+   * the thumb between one keystroke and the next. */
+  function searchEmoji(query) {
+    const ranked = [];
+    for (const item of EMOJI_INDEX) {
+      const at = item.name.indexOf(query);
+      if (at < 0) continue;
+      ranked.push({ item, rank: at === 0 ? 0 : item.name[at - 1] === ' ' ? 1 : 2 });
+    }
+    ranked.sort((a, b) => a.rank - b.rank);
+    return ranked.slice(0, EMOJI_HITS).map((hit) => hit.item);
+  }
+
+  /* Draws the whole picker — search box, tab strip, grid — into `container`.
+   *
+   * options.pick(emoji)    what to do with a tap
+   * options.picked(emoji)  optional, marks the ones already on a message
+   */
+  function buildEmojiPicker(container, options) {
+    container.innerHTML = '';
+    const tabs = emojiTabs();
+    if (emojiTab >= tabs.length) emojiTab = 0;
+
+    const query = el('input', 'emoji-q');
+    query.type = 'search';
+    query.placeholder = 'Search emoji…';
+    query.autocomplete = 'off';
+    query.spellcheck = false;
+    query.setAttribute('autocorrect', 'off');
+    query.setAttribute('aria-label', 'Search emoji');
+    // Not focused on open. The panel exists so you can *browse*, and stealing
+    // focus would raise the keyboard over the grid you came to look at.
+
+    const strip = el('div', 'emoji-tabs');
+    const scroll = el('div', 'emoji-scroll');
+
+    /* One listener on the scroller, not one per button.
+     *
+     * The old picker bound a closure to each of its ninety-six buttons, which
+     * was free. At two hundred-odd buttons per category, rebuilt on every tab
+     * tap and every keystroke, it is two hundred closures and two hundred
+     * listener registrations thrown away a moment later — the cost is in the
+     * churn, not the count. The emoji is on the button, so the event already
+     * carries everything the handler needs. */
+    scroll.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-emoji]');
+      if (!button) return;
+      options.pick(button.dataset.emoji);
+    });
+
+    const drawGrid = (items) => {
+      const grid = el('div', 'emoji-grid');
+      // Into a fragment first: appending each button to a grid that is already
+      // on screen is a layout pass per emoji, and at this size that is the
+      // difference between the panel appearing and the panel arriving.
+      const batch = document.createDocumentFragment();
+      items.forEach((item) => {
+        const button = el('button', null, item.char);
+        button.type = 'button';
+        button.dataset.emoji = item.char;
+        if (item.name) button.title = item.name;
+        if (options.picked && options.picked(item.char)) button.classList.add('picked');
+        batch.appendChild(button);
+      });
+      grid.appendChild(batch);
+      return grid;
+    };
+
+    /* Only ever one category in the DOM at a time. Every category at once is
+     * fourteen hundred buttons, and a panel that takes a visible beat to open
+     * is a panel you stop reaching for. */
+    const render = () => {
+      const text = query.value.trim().toLowerCase();
+      strip.classList.toggle('dim', !!text);
+      scroll.innerHTML = '';
+      scroll.scrollTop = 0;
+      if (text) {
+        const hits = searchEmoji(text);
+        if (!hits.length) {
+          scroll.appendChild(el('div', 'emoji-head', 'Nothing matches that'));
+          return;
+        }
+        scroll.appendChild(
+          el('div', 'emoji-head', hits.length >= EMOJI_HITS ? 'Closest matches' : 'Matches')
+        );
+        scroll.appendChild(drawGrid(hits));
+        return;
+      }
+      const tab = tabs[emojiTab];
+      if (!tab) return;
+      scroll.appendChild(el('div', 'emoji-head', tab.name));
+      scroll.appendChild(drawGrid(tab.items));
+    };
+
+    tabs.forEach((tab, i) => {
+      const button = el('button', i === emojiTab ? 'on' : null, tab.icon);
+      button.type = 'button';
+      button.title = tab.name;
+      button.setAttribute('aria-label', tab.name);
+      button.addEventListener('click', () => {
+        emojiTab = i;
+        // A tab tap is a request to see that tab, so it has to drop whatever
+        // is in the search box — otherwise the strip highlights Food and the
+        // grid goes on showing the results for "heart".
+        query.value = '';
+        Array.from(strip.children).forEach((node, j) => node.classList.toggle('on', j === i));
+        render();
+      });
+      strip.appendChild(button);
+    });
+
+    // No debounce. The message search has one because it walks every message
+    // on the device; this walks fourteen hundred short strings and caps what it
+    // draws, so a keystroke is cheaper than the timer would be.
+    query.addEventListener('input', render);
+    query.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape' || !query.value) return;
+      // Escape empties the box before it does anything else — in the sheet the
+      // next Escape closes the sheet, and losing the whole picker when you
+      // meant to clear four letters is a long way back.
+      event.stopPropagation();
+      query.value = '';
+      render();
+    });
+
+    container.appendChild(query);
+    container.appendChild(strip);
+    container.appendChild(scroll);
+    render();
+
+    /* The strip is a sideways scroller and the tab we are showing is remembered
+     * across opens, so reopening on Flags drew the strip at its left-hand end
+     * with the one lit tab somewhere off the right — which reads as no tab lit
+     * at all, under a grid of flags. Set scrollLeft directly rather than call
+     * scrollIntoView, which is entitled to scroll every ancestor too and does:
+     * in the sheet it dragged the sheet itself. */
+    const active = strip.children[emojiTab];
+    if (active) strip.scrollLeft = active.offsetLeft - (strip.clientWidth - active.offsetWidth) / 2;
   }
 
   function buildEmoji() {
-    const panel = $('emoji');
-    panel.innerHTML = '';
-    Object.entries(emojiGroups()).forEach(([group, list]) => {
-      panel.appendChild(el('div', 'emoji-head', group));
-      const grid = el('div', 'emoji-grid');
-      list.forEach((emoji) => {
-        const button = el('button', null, emoji);
-        button.type = 'button';
-        button.addEventListener('click', () => {
-          const box = $('text');
-          setTextOf(box, textOf(box) + emoji);
-          noteEmoji(emoji);
-          autogrow();
-          saveDraft();
-        });
-        grid.appendChild(button);
-      });
-      panel.appendChild(grid);
+    buildEmojiPicker($('emoji'), {
+      pick: (emoji) => {
+        const box = $('text');
+        setTextOf(box, textOf(box) + emoji);
+        noteEmoji(emoji);
+        autogrow();
+        saveDraft();
+      },
     });
   }
 
@@ -5945,7 +6113,23 @@
       }
     });
     $('send').addEventListener('click', onSend);
-    $('emoji-btn').addEventListener('click', () => $('emoji').classList.toggle('on'));
+    $('emoji-btn').addEventListener('click', () => {
+      const panel = $('emoji');
+      const opening = !panel.classList.contains('on');
+      /* Drawn on the way in rather than once at boot.
+       *
+       * Two reasons, and the second only became one when the catalogue grew.
+       * The panel leads with your most used, and a tally read at startup is
+       * yesterday's tally — the panel spent a whole session offering the six
+       * you liked last week. And building it here keeps a few hundred buttons
+       * off the boot path, which now matters: the app used to build ninety-six
+       * of them before the lock screen had even drawn.
+       *
+       * Shown first, then built — the picker measures the tab strip to scroll
+       * the live tab into view, and a display:none panel measures zero. */
+      panel.classList.toggle('on', opening);
+      if (opening) buildEmoji();
+    });
     $('attach').addEventListener('click', () => $('file-input').click());
     $('file-input').addEventListener('change', (event) => {
       onFiles(event.target.files);
@@ -6251,7 +6435,9 @@
 
     buildDots();
     buildKeypad();
-    buildEmoji();
+    // buildEmoji() is not here any more — the picker is drawn the first time
+    // the ☺ is tapped, so its "most used" is the tally as it stands then and
+    // not as it stood at boot.
     wire();
     trackKeyboard();
     watchVisibility();

@@ -266,8 +266,38 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 #send:disabled{opacity:.45;}
 
 /* ---------------- Emoji ---------------- */
-#emoji{display:none;height:270px;overflow-y:auto;overscroll-behavior:contain;padding:6px 4px;}
-#emoji.on{display:block;}
+/* max-height as well as height: 300px is a comfortable five rows on a phone
+   held upright and most of the screen on one turned sideways, where the thread
+   it is covering disappears entirely. */
+#emoji{display:none;height:300px;max-height:46dvh;padding:6px 4px;}
+/* A flex column, not a block, because the search box and the tab strip must
+   stay put while only the grid moves. They were inside the scroller first, and
+   scrolling down into Symbols carried the search box off the top — the one
+   control you want when you are that far into a category is the one that had
+   just left the screen. */
+#emoji.on{display:flex;flex-direction:column;min-height:0;}
+/* min-height:0 is load-bearing on both of these. A flex item's default minimum
+   is its content, so a grid of two hundred buttons refuses to shrink, the
+   scroller never gets a height smaller than its contents, and nothing scrolls
+   at all — the panel just grows until it has pushed the composer off. */
+.emoji-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;}
+.emoji-q{flex:0 0 auto;width:100%;border:0;outline:0;background:var(--surface);
+         border-radius:18px;padding:7px 12px;min-height:34px;font-size:14px;}
+.emoji-q::placeholder{color:#5d7d87;}
+/* Ten tabs will not fit across a 320px phone, so the strip scrolls sideways
+   rather than shrinking each one below a thumb. The scrollbar is hidden because
+   on a desktop it ate a third of the height of a 30px-tall row. */
+.emoji-tabs{display:flex;gap:2px;flex:0 0 auto;overflow-x:auto;overscroll-behavior-x:contain;
+            scrollbar-width:none;padding:5px 2px 4px;margin-bottom:2px;
+            border-bottom:1px solid var(--line);}
+.emoji-tabs::-webkit-scrollbar{display:none;}
+.emoji-tabs button{flex:0 0 auto;width:34px;height:30px;font-size:17px;border-radius:8px;opacity:.5;}
+.emoji-tabs button.on{opacity:1;background:var(--surface-2);}
+/* While a search is running the grid is not showing any category, so nothing in
+   the strip is lit. Leaving Food highlighted under the results for "heart" read
+   as though those were Food's — which is exactly the wrong thing to imply about
+   a list you are about to pick from. */
+.emoji-tabs.dim button.on{opacity:.5;background:none;}
 .emoji-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:2px;}
 .emoji-grid button{height:42px;font-size:24px;border-radius:10px;}
 .emoji-grid button:active{background:var(--surface);}
@@ -293,7 +323,13 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 #sheet{position:fixed;left:0;right:0;bottom:0;z-index:9;transform:translateY(102%);
        transition:transform .24s cubic-bezier(.2,.8,.3,1);
        background:var(--surface);border-radius:22px 22px 0 0;
-       padding:8px 10px calc(12px + var(--safe-bottom));box-shadow:0 -8px 30px #0009;
+       /* --kb in the bottom padding, so a sheet with something to type into
+          rides above the keyboard instead of underneath it. On Android the
+          layout viewport already shrinks (interactive-widget=resizes-content)
+          and --kb stays at 0, so this changes nothing there; on iOS, where it
+          does not, the emoji picker's search box and the PIN entry were both
+          being opened directly under the keyboard that opening them raised. */
+       padding:8px 10px calc(12px + var(--kb) + var(--safe-bottom));box-shadow:0 -8px 30px #0009;
        max-height:calc(100dvh - var(--safe-top) - 56px);
        overflow-y:auto;overscroll-behavior:contain;}
 #sheet.on{transform:translateY(0);}
@@ -312,8 +348,11 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 
 /* The full catalogue inside a sheet. Uncapped it grows past the top of the
    screen and the last group cannot be reached — the sheet is anchored to the
-   bottom, so it is the *start* of the list that disappears. */
-.picker{max-height:46dvh;overflow-y:auto;overscroll-behavior:contain;}
+   bottom, so it is the *start* of the list that disappears.
+   The scrolling moved down to .emoji-scroll when the picker grew a search box
+   and a tab strip: this is the column those three sit in, and only the third
+   of them is allowed to move. */
+.picker{display:flex;flex-direction:column;min-height:0;max-height:52dvh;}
 .act{display:flex;align-items:center;gap:14px;width:100%;padding:13px 12px;border-radius:12px;font-size:16px;}
 .act:active{background:var(--surface-2);}
 .act .ico{width:22px;text-align:center;font-size:17px;}
@@ -551,6 +590,10 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 <script src="./crypto.js"></script>
 <script src="./db.js"></script>
 <script src="./api.js"></script>
+<!-- Before app.js, which reads ReefEmoji off the global while it is defining
+     its picker. Data only, no dependencies of its own, so it can sit anywhere
+     above that line. -->
+<script src="./emoji-data.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>
