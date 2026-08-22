@@ -271,10 +271,12 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
 .emoji-grid{display:grid;grid-template-columns:repeat(8,1fr);gap:2px;}
 .emoji-grid button{height:42px;font-size:24px;border-radius:10px;}
 .emoji-grid button:active{background:var(--surface);}
-/* The fish you are wearing, or the reaction already on a message. A background
-   alone was too quiet to find in a grid of two dozen, and it was set as an
-   inline style so nothing could reliably clear it. */
-.emoji-grid button.picked,.quickreacts button.picked{
+/* The fish you are wearing, or the reaction already on a message — and, in
+   the lock sheet, which "lock after" preset is live. A background alone was
+   too quiet to find in a grid of two dozen, which is the same reason a bare
+   checkmark character wasn't enough to read as "this one, not that one" in a
+   plain list either. */
+.emoji-grid button.picked,.quickreacts button.picked,.act.picked{
   background:var(--surface-2);box-shadow:inset 0 0 0 2px var(--accent);}
 .emoji-head{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;margin:8px 6px 3px;}
 
@@ -453,7 +455,7 @@ button{background:none;border:0;cursor:pointer;touch-action:manipulation;}
         <b id="peer-name">Reef</b>
         <span id="peer-state">connecting…</span>
       </div>
-      <button class="tap" id="search-btn" aria-label="Search">🔍</button>
+      <button class="tap" id="lock-btn" aria-label="Lock now">🔒</button>
       <button class="tap" id="menu" aria-label="More">⋯</button>
     </header>
 

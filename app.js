@@ -541,7 +541,26 @@
     // here rather than on arrival in the room, so a room that fails to open
     // does not leave the app locked against a PIN the server just accepted.
     await DB.setLocked(false).catch(() => {});
+    markUnlockedThisTab();
     await enterRoom(preferred.room_id, preferred);
+  }
+
+  /* Records that this tab, specifically, made it past the lock screen.
+   *
+   * Read by boot() as `sameSession` for the lock-on-reopen setting: a fresh
+   * tab has never called this, so it relocks; a tab that already has, calling
+   * it again on every later refresh is a no-op, which is what makes a plain
+   * reload not count as "closing the app" once you are already in. Called
+   * from here (the PIN was just accepted) and from boot()'s own direct-resume
+   * branch (no PIN was needed at all) — the two ways a tab actually ends up
+   * unlocked. */
+  function markUnlockedThisTab() {
+    try {
+      sessionStorage.setItem('reef-unlocked', '1');
+    } catch (e) {
+      /* private mode: next load just relocks again, which is the safe way to
+       * fail. */
+    }
   }
 
   /* Keeps the stored copy of a room's auto-approve flag honest.
@@ -3661,6 +3680,10 @@
       if (waiting) {
         action('📨', `Requests (${waiting})`, openRequestsSheet);
       }
+      // Used to be its own header button. That slot went to Lock now instead —
+      // reached for in a hurry, where finding a message is not — so search
+      // moved here rather than off the menu entirely.
+      action('🔍', 'Search', openSearch);
       action('🏷', 'My code', openCodeSheet);
       // "Start a conversation" was ambiguous about whether it joined this one or
       // began another. It now depends on where you are: an empty seat here gets
@@ -3727,8 +3750,12 @@
     }
     const chosen = LOCK_PRESETS[state.lockAfter] ? state.lockAfter : LOCK_DEFAULT;
     openSheet((sheet) => {
-      const row = (icon, label, sub, fn) => {
-        const button = el('button', 'act');
+      // `picked` gets the same background-plus-ring treatment as an emoji
+      // reaction already wearing your fish. A lone checkmark character in the
+      // icon slot turned out too quiet to read as "this one, not that one" at
+      // a glance — the exact thing that ring was already built to fix once.
+      const row = (icon, label, sub, fn, picked) => {
+        const button = el('button', 'act' + (picked ? ' picked' : ''));
         button.appendChild(el('span', 'ico', icon));
         if (sub) {
           const stack = el('div', 'stack');
@@ -3751,10 +3778,17 @@
         )
       );
       Object.keys(LOCK_PRESETS).forEach((key) => {
-        row(key === chosen ? '✓' : '', LOCK_PRESETS[key].label, null, async () => {
-          await setLockAfter(key);
-          openLockSheet();
-        });
+        const isChosen = key === chosen;
+        row(
+          isChosen ? '✓' : '',
+          LOCK_PRESETS[key].label,
+          null,
+          async () => {
+            await setLockAfter(key);
+            openLockSheet();
+          },
+          isChosen
+        );
       });
 
       sheet.appendChild(
@@ -5968,7 +6002,10 @@
     $('select-hide').addEventListener('click', bulkHideForMe);
     $('select-delete').addEventListener('click', bulkDeleteForEveryone);
 
-    $('search-btn').addEventListener('click', openSearch);
+    // Search moved into the menu (below) — a header button is prime real
+    // estate, and locking is something you reach for in a hurry, which
+    // finding a conversation from is not.
+    $('lock-btn').addEventListener('click', lockNow);
     $('search-close').addEventListener('click', closeSearch);
     $('search-input').addEventListener('input', () => {
       clearTimeout(searchTimer);
@@ -6158,21 +6195,21 @@
    * ==================================================================== */
 
   async function boot() {
-    /* Whether the app was already open, or is being opened.
+    /* Whether *this tab* has ever actually gotten past the lock screen.
      *
-     * sessionStorage is per tab and dies with it, so a key that is already
-     * there means this page load is a refresh, a navigation, or the reload the
-     * service worker triggers when it takes over — and one that is missing
-     * means the app was actually closed and reopened. Read before anything
-     * else, because a great deal below reloads the page.
-     *
-     * Nothing else can tell these apart: an installed PWA gets a plain cold
-     * start either way, and the "was it locked" flag in the vault deliberately
-     * says nothing about it. See the lock-on-reopen check further down. */
+     * sessionStorage is per tab and dies with it, so this is the closest thing
+     * to "was the app already open". The key is only ever written once this
+     * tab genuinely reaches an unlocked room — see markUnlockedThisTab, called
+     * from both the direct-resume branch below and from enterFromResult (the
+     * PIN-accepted path) — never here at the top, unconditionally, which is
+     * what this used to do and why it didn't work: reading it that early wrote
+     * it too, so a relock screen was itself enough to mark the tab "unlocked",
+     * and reloading that same lock screen read its own mark back and walked
+     * straight past itself. Read before anything else because a great deal
+     * below reloads the page. */
     let sameSession = false;
     try {
-      sameSession = sessionStorage.getItem('reef-live') === '1';
-      sessionStorage.setItem('reef-live', '1');
+      sameSession = sessionStorage.getItem('reef-unlocked') === '1';
     } catch (e) {
       // Storage blocked entirely, which private mode does. Every load then
       // reads as a fresh open — erring towards asking for the PIN, which is
@@ -6298,6 +6335,7 @@
       API.setToken(sessions[roomId].token);
       try {
         await enterRoom(roomId);
+        markUnlockedThisTab();
         return;
       } catch (err) {
         if (err.offline) {
@@ -6314,6 +6352,7 @@
             auto_approve_devices: !!sessions[roomId].autoApprove,
           };
           state.locked = false;
+          markUnlockedThisTab();
           showScreen('pool');
           await loadProfileSettings();
           // Also here, and not only in afterUnlock. The very first load after
